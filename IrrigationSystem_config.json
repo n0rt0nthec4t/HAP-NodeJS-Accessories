@@ -1,0 +1,62 @@
+{
+    "tank" : {
+        "TankHeight": 1970,
+        "MinimumLevel": 200,
+        "TankSensorTrigPin": 20,
+        "TankSensorEchoPin": 21
+    },
+
+    "system" : {
+        "MaxRunningZones": 1
+    },
+    
+    "zones": [{
+        "name": "Zone 1",
+        "relayPin": 14,
+        "DefaultRunTime": 1200,
+        "MaxRunTime": 7200,
+        "Enabled": true
+    }, {
+        "name": "Zone 2",
+        "relayPin": 15,
+        "DefaultRunTime": 1200,
+        "MaxRunTime": 7200,
+        "Enabled": true
+    }, {
+        "name": "Zone 3",
+        "relayPin": 18,
+        "DefaultRunTime": 1200,
+        "MaxRunTime": 7200,
+        "Enabled": true
+    }, {
+        "name": "Zone 4",
+        "relayPin": 23,
+        "DefaultRunTime": 1200,
+        "MaxRunTime": 7200,
+        "Enabled": true
+    }, {
+        "name": "Zone 5",
+        "relayPin": 24,
+        "DefaultRunTime": 1200,
+        "MaxRunTime": 7200,
+        "Enabled": true
+    }, {
+        "name": "Zone 6",
+        "relayPin": 25,
+        "DefaultRunTime": 1200,
+        "MaxRunTime": 7200,
+        "Enabled": true
+    }, {
+        "name": "Zone 7",
+        "relayPin": 8,
+        "DefaultRunTime": 1200,
+        "MaxRunTime": 7200,
+        "Enabled": true
+    }, {
+        "name": "Zone 8",
+        "relayPin": 7,
+        "DefaultRunTime": 1200,
+        "MaxRunTime": 7200,
+        "Enabled": true
+    }]
+}
