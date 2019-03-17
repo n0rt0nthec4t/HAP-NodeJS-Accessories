@@ -276,19 +276,25 @@ SonyTVClass.prototype = {
                 this.__TVService.addLinkedService(this.__TVInputs[index].__InputService);
             }
             
-            // Add an input for the tuner. This doesnt appear in the list of external inputs
-            index++;
-            this.__TVInputs[index] = new InputClass();
-            this.__TVInputs[index].__InputService = this.__accessory.addService(Service.InputSource, "Digital Tuner", index);
-            this.__TVInputs[index].__uri = "tv:dvbt";
-            this.__TVInputs[index].__ID = index;
-            this.__TVInputs[index].__InputService.setCharacteristic(Characteristic.InputSourceType, Characteristic.InputSourceType.TUNER);
-            this.__TVInputs[index].__InputService.setCharacteristic(Characteristic.IsConfigured, Characteristic.IsConfigured.CONFIGURED);
-            this.__TVInputs[index].__InputService.setCharacteristic(Characteristic.CurrentVisibilityState, Characteristic.CurrentVisibilityState.SHOWN);
-            this.__TVInputs[index].__InputService.setCharacteristic(Characteristic.TargetVisibilityState, Characteristic.CurrentVisibilityState.SHOWN);
-            this.__TVInputs[index].__InputService.setCharacteristic(Characteristic.Identifier, index);
-            this.__TVInputs[index].__InputService.getCharacteristic(Characteristic.TargetVisibilityState).on('set', this.HomeKitInputStatus.bind(this.__TVInputs[index]));
-            this.__TVService.addLinkedService(this.__TVInputs[index].__InputService);
+            // Add an input(s) for any tuners. This doesnt appear in the list of external inputs, so we use another call to see whats defined        
+            var response = request("POST", "http://" + SonyTVIP + "/sony/avContent", {headers: {"X-Auth-PSK": SonyTVPSK}, json: {"method": "getSourceList", "id": 1, "params": [{"scheme": "tv"}], "version": "1.0"} });
+            if (response.statusCode == 200 && typeof JSON.parse(response.body).result !== 'undefined') {
+                var tempInputList = JSON.parse(response.body).result[0];
+                for (var index2 in tempInputList) {
+                    index++;    // Use index from previous input list loop to increase here
+                    this.__TVInputs[index] = new InputClass();
+                    this.__TVInputs[index].__InputService = this.__accessory.addService(Service.InputSource, (tempInputList[index2].source.substr(0,4).toUpperCase() == "TV:D" ? "Digital Tuner" : "Tuner"), index);
+                    this.__TVInputs[index].__uri = tempInputList[index2].source;
+                    this.__TVInputs[index].__ID = index;
+                    this.__TVInputs[index].__InputService.setCharacteristic(Characteristic.InputSourceType, Characteristic.InputSourceType.TUNER);
+                    this.__TVInputs[index].__InputService.setCharacteristic(Characteristic.IsConfigured, Characteristic.IsConfigured.CONFIGURED);
+                    this.__TVInputs[index].__InputService.setCharacteristic(Characteristic.CurrentVisibilityState, Characteristic.CurrentVisibilityState.SHOWN);
+                    this.__TVInputs[index].__InputService.setCharacteristic(Characteristic.TargetVisibilityState, Characteristic.CurrentVisibilityState.SHOWN);
+                    this.__TVInputs[index].__InputService.setCharacteristic(Characteristic.Identifier, index);
+                    this.__TVInputs[index].__InputService.getCharacteristic(Characteristic.TargetVisibilityState).on('set', this.HomeKitInputStatus.bind(this.__TVInputs[index]));
+                    this.__TVService.addLinkedService(this.__TVInputs[index].__InputService);
+                }
+            }
         }
         else {
             console.log("Failed to get input list from Sony TV @", SonyTVIP);
