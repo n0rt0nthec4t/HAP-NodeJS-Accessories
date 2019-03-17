@@ -2,7 +2,6 @@
 // 
 // https://pro-bravia.sony.net/develop/
 //
-// Mark Hulskamp
 var JSONPackage = require('../package.json')
 var Accessory = require('../').Accessory; 
 var Service = require('../').Service;

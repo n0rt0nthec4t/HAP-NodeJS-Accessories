@@ -4,7 +4,6 @@
 // https://github.com/scarface-4711/denonavr
 // https://www.heimkinoraum.de/upload/files/product/IP_Protocol_AVR-Xx100.pdf
 //
-// Mark Hulskamp
 var JSONPackage = require('../package.json')
 var Accessory = require('../').Accessory; 
 var Service = require('../').Service;
