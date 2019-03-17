@@ -10,10 +10,10 @@ var uuid = require('../').uuid;
 var request = require('sync-request');
 
 // Defines for the accessory
-const AccessoryName =  "Television";                        // name of accessory
+const AccessoryName =  "Sony Bravia TV";                    // name of accessory
 const AccessoryPincode = "031-45-154";                      // pin code for paring  
 
-const SonyTVIP = "x.x.x.x";                                 // IP address for TV
+const SonyTVIP = "xxx.xxx.xxx";                              // IP address for TV
 const SonyTVPSK = "0000";                                   // PSK key
 
 
@@ -99,8 +99,13 @@ SonyTVClass.prototype = {
             // search thru the input list to work out which input is to be selected
             if (inputID == this.__TVInputs[index].__ID) {
                 var response = request("POST", "http://" + SonyTVIP + "/sony/avContent", {headers: {"X-Auth-PSK": SonyTVPSK}, json: {"method": "setPlayContent", "id": 13, "params": [{"uri": this.__TVInputs[index].__uri}],  "version": "1.0"} });
-                if (response.statusCode == 200 && typeof JSON.parse(response.body).result !== 'undefined') {
-                    console.log("Set input on Sony TV @" + SonyTVIP + " to " + this.__TVInputs[index].__uri);
+                if (response.statusCode == 200) {
+                    if (typeof JSON.parse(response.body).result !== 'undefined') {
+                        console.log("Set input on Sony TV @" + SonyTVIP + " to " + this.__TVInputs[index].__uri);
+                    } else {
+                        // REST API post failed, mosy likely due to display off, so cache value we wanted to set
+                        this.__waitSetInput = inputID;
+                    }
                 } else {
                     // REST API post failed, so cache value we wanted to set
                     this.__waitSetInput = inputID;
@@ -220,8 +225,8 @@ SonyTVClass.prototype = {
 
     __buildInputList: function() {
         // Build and setup HomeKit objects for the available inputs on the TV
-        var response = request("POST", "http://" + SonyTVIP + "/sony/avContent", {headers: {"X-Auth-PSK": SonyTVPSK}, json: {"method": "getCurrentExternalInputsStatus", "id": 105, "params": [""], "version": "1.0"} });
-        if (response.statusCode == 200 && typeof JSON.parse(response.body).result !== 'undefined') {
+        var response = request("POST", "http://" + SonyTVIP + "/sony/avContent", {headers: {"X-Auth-PSK": SonyTVPSK}, json: {"method": "getCurrentExternalInputsStatus", "id": 105, "params": [""], "version": "1.1"} });
+        if (response.statusCode == 200) {
             var tempInputList = JSON.parse(response.body).result[0];
             for (var index in tempInputList) {
                 this.__TVInputs[index] = new InputClass();
@@ -230,15 +235,14 @@ SonyTVClass.prototype = {
                 this.__TVInputs[index].__ID = index;
 
                 if (tempInputList[index].label != "") {
+                    //this.__TVInputs[index].__InputService.setCharacteristic(Characteristic.ConfiguredName, tempInputList[index].label);
                     this.__TVInputs[index].__InputService.setCharacteristic(Characteristic.ConfiguredName, tempInputList[index].title + " (" + tempInputList[index].label + ")");
                 }
-    
+      
                 this.__TVInputs[index].__InputService.setCharacteristic(Characteristic.IsConfigured, Characteristic.IsConfigured.CONFIGURED);
-                this.__TVInputs[index].__InputService.setCharacteristic(Characteristic.CurrentVisibilityState, Characteristic.CurrentVisibilityState.SHOWN);
-                this.__TVInputs[index].__InputService.setCharacteristic(Characteristic.TargetVisibilityState, Characteristic.CurrentVisibilityState.SHOWN);    
                 this.__TVInputs[index].__InputService.setCharacteristic(Characteristic.Identifier, index);
 
-                // Determine the input type by the "icon" tag. Split after the "meta:" entry for the type
+                // Determine teh input type by the "icon" tag. Split after the "meta:" entry for the type
                 switch(tempInputList[index].icon.split(":")[1].toUpperCase())
                 {
                     case "HDMI" :
@@ -271,7 +275,6 @@ SonyTVClass.prototype = {
                         break
                     }
                 }
-                this.__TVInputs[index].__InputService.getCharacteristic(Characteristic.TargetVisibilityState).on('set', this.HomeKitInputStatus.bind(this.__TVInputs[index]));
                 this.__TVService.addLinkedService(this.__TVInputs[index].__InputService);
             }
             
@@ -283,10 +286,7 @@ SonyTVClass.prototype = {
             this.__TVInputs[index].__ID = index;
             this.__TVInputs[index].__InputService.setCharacteristic(Characteristic.InputSourceType, Characteristic.InputSourceType.TUNER);
             this.__TVInputs[index].__InputService.setCharacteristic(Characteristic.IsConfigured, Characteristic.IsConfigured.CONFIGURED);
-            this.__TVInputs[index].__InputService.setCharacteristic(Characteristic.CurrentVisibilityState, Characteristic.CurrentVisibilityState.SHOWN);
-            this.__TVInputs[index].__InputService.setCharacteristic(Characteristic.TargetVisibilityState, Characteristic.CurrentVisibilityState.SHOWN);
             this.__TVInputs[index].__InputService.setCharacteristic(Characteristic.Identifier, index);
-            this.__TVInputs[index].__InputService.getCharacteristic(Characteristic.TargetVisibilityState).on('set', this.HomeKitInputStatus.bind(this.__TVInputs[index]));
             this.__TVService.addLinkedService(this.__TVInputs[index].__InputService);
         }
         else {
@@ -294,15 +294,8 @@ SonyTVClass.prototype = {
         }     
     },
 
-    HomeKitInputStatus: function(state, callback) {
-        // Allow enabling/disble input section in homekit
-        this.__InputService.getCharacteristic(Characteristic.CurrentVisibilityState).updateValue(state);
-        this.__InputService.getCharacteristic(Characteristic.TargetVisibilityState).updateValue(state);
-        callback();
-    },
-
     __buildApplicationList: function() {
-        // TODO
+
     },
 
     refreshHomeKit: function(refreshTimeMS) {
@@ -316,21 +309,17 @@ SonyTVClass.prototype = {
     },
 
     __SonyTVStatus: function() {
-        const scale = (num, in_min, in_max, out_min, out_max) => {
-            if (num > out_max) num = out_max;
-            if (num < out_min) num = out_min;
-            return (num - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
-        }
-
         if (this.__updatingHomeKit == false) {
             // Get power status
             var response = request("POST", "http://" + SonyTVIP + "/sony/system", {headers: {"X-Auth-PSK": SonyTVPSK}, json: {"method": "getPowerStatus", "id": 50, "params": [""],  "version": "1.0"} });
-            if (response.statusCode == 200 && typeof JSON.parse(response.body).result !== 'undefined') {
-                this.__TVService.getCharacteristic(Characteristic.Active).updateValue((JSON.parse(response.body).result[0].status.toUpperCase() == "ACTIVE" ? Characteristic.Active.ACTIVE : Characteristic.Active.INACTIVE));
+            if (response.statusCode == 200) {
+                if (typeof JSON.parse(response.body).result !== 'undefined') {
+                    this.__TVService.getCharacteristic(Characteristic.Active).updateValue((JSON.parse(response.body).result[0].status.toUpperCase() == "ACTIVE" ? Characteristic.Active.ACTIVE : Characteristic.Active.INACTIVE));
 
-                if (JSON.parse(response.body).result[0].status.toUpperCase() == "ACTIVE" && this.__waitSetInput != null) {
-                    // TVs been switched on externally to HomeKit and we have an "cached input value. We'll clear the cached value in this case and let teh loop below update the current state
-                    this.__waitSetInput = null;
+                    if (JSON.parse(response.body).result[0].status.toUpperCase() == "ACTIVE" && this.__waitSetInput != null) {
+                        // TVs been switched on externally to HomeKit and we have an "cached input value. We'll clear the cached value in this case and let teh loop below update the current state
+                        this.__waitSetInput = null;
+                    }
                 }
             }
         }
@@ -338,30 +327,34 @@ SonyTVClass.prototype = {
         if (this.__updatingHomeKit == false) {
             // Get active input
             var response = request("POST", "http://" + SonyTVIP + "/sony/avContent", {headers: {"X-Auth-PSK": SonyTVPSK}, json: {"method": "getPlayingContentInfo", "id": 103, "params": [""],  "version": "1.0"} });
-            if (response.statusCode == 200 && typeof JSON.parse(response.body).result !== 'undefined') {
-                for (var index in this.__TVInputs) {
-                    // search thru the input list to work out which input is to be selected
-                    if ((JSON.parse(response.body).result[0].uri == this.__TVInputs[index].__uri) || (JSON.parse(response.body).result[0].source == "tv:dvbt" && JSON.parse(response.body).result[0].source == this.__TVInputs[index].__uri)) {
-                        this.__TVService.getCharacteristic(Characteristic.ActiveIdentifier).updateValue(this.__TVInputs[index].__ID);
+            if (response.statusCode == 200) {
+                if (typeof JSON.parse(response.body).result !== 'undefined') {
+                    for (var index in this.__TVInputs) {
+                        // search thru the input list to work out which input is to be selected
+                        if ((JSON.parse(response.body).result[0].uri == this.__TVInputs[index].__uri) || (JSON.parse(response.body).result[0].source == "tv:dvbt" && JSON.parse(response.body).result[0].source == this.__TVInputs[index].__uri)) {
+                            this.__TVService.getCharacteristic(Characteristic.ActiveIdentifier).updateValue(this.__TVInputs[index].__ID);
+                        }
                     }
                 }
-            } else if (this.__waitSetInput != null) {
-                // since we got an error requesting inputs, we assume TV is off.. So if we have an input waiting to be set with the physcial TV, update that to reflect in HomeKit
-                this.__TVService.getCharacteristic(Characteristic.ActiveIdentifier).updateValue(this.__waitSetInput);
+                else if (this.__waitSetInput != null) {
+                    // since we got an error requesting inputs, we assume TV is off.. So if we have an input waiting to be set with the physcial TV, update that to reflect in HomeKit
+                    this.__TVService.getCharacteristic(Characteristic.ActiveIdentifier).updateValue(this.__waitSetInput);
+                }
             }
         }
         
         if (this.__updatingHomeKit == false) {
             // get volume information
             var response = request("POST", "http://" + SonyTVIP + "/sony/avContent", {headers: {"X-Auth-PSK": SonyTVPSK}, json: {"method": "getVolumeInformation", "id": 33, "params": [""],  "version": "1.0"} });
-            if (response.statusCode == 200 && typeof JSON.parse(response.body).result !== 'undefined') {
-                var tempVolumeInfo = JSON.parse(response.body).result[0];
-                for (var index in tempVolumeInfo)
-                {
-                    if (tempVolumeInfo[index].target.toUpperCase() == "SPEAKER")
+            if (response.statusCode == 200) {
+                if (typeof JSON.parse(response.body).result !== 'undefined') {
+                    var tempVolumeInfo = JSON.parse(response.body).result[0];
+                    for (var index in tempVolumeInfo)
                     {
-                        // Scale volume
-                        this.__SpeakerService.getCharacteristic(Characteristic.Volume).updateValue(scale(tempVolumeInfo[index].volume, tempVolumeInfo[index].minVolume, tempVolumeInfo[index].maxVolume, 0, 100));
+                        if (tempVolumeInfo[index].target.toUpperCase() == "SPEAKER")
+                        {
+                            this.__SpeakerService.getCharacteristic(Characteristic.Volume).updateValue(tempVolumeInfo[index].volume);
+                        }
                     }
                 }
             }
@@ -370,7 +363,7 @@ SonyTVClass.prototype = {
 }
 
 var response = request("POST", "http://" + SonyTVIP + "/sony/system", {headers: {"X-Auth-PSK": SonyTVPSK}, json: {"method": "getSystemInformation", "id": 33, "params": [""], "version": "1.0"} });
-if (response.statusCode == 200 && typeof JSON.parse(response.body).result !== 'undefined') {
+if (response.statusCode == 200) {
     var SonyTVSystemInfo = JSON.parse(response.body).result[0];
     var SonyTV = new SonyTVClass();
     SonyTV.__accessory = exports.accessory = new Accessory(AccessoryName, uuid.generate("hap-nodejs:accessories:sony_"));
