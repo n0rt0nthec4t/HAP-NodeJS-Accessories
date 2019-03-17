@@ -4,6 +4,7 @@
 // https://github.com/scarface-4711/denonavr
 // https://www.heimkinoraum.de/upload/files/product/IP_Protocol_AVR-Xx100.pdf
 //
+// Mark Hulskamp
 var JSONPackage = require('../package.json')
 var Accessory = require('../').Accessory; 
 var Service = require('../').Service;
@@ -16,7 +17,7 @@ var parseString = require('xml2js').parseString;
 const AccessoryName =  "Amplifier";                     // default name of accessory
 const AccessoryPincode = "031-45-154";                  // pin code for paring  
 
-const DenonIP = "xxx.xxx.xxx.xx";                           // IP address for AMP
+const DenonIP = "x.x.x.x";                              // IP address for AMP
 
 
 
@@ -326,15 +327,17 @@ DenonClass.prototype = {
                         }        
                     }
     
-                    // Loop through to see if this input is "hidden" on the denon. If it is not, mark as configured
-                    thisObject.__AVInputs[index].__InputService.setCharacteristic(Characteristic.IsConfigured, Characteristic.IsConfigured.NOT_CONFIGURED);
+                    // Loop through to see if this input is "hidden" on the denon. Mark as shown or hidden depending on configuration
+                    thisObject.__AVInputs[index].__InputService.setCharacteristic(Characteristic.IsConfigured, Characteristic.IsConfigured.CONFIGURED);
+  
                     for (var index2 in result.rx.cmd[1].functiondelete[0].list) {
                         if (result.rx.cmd[1].functiondelete[0].list[index2].name == result.rx.cmd[0].functionrename[0].list[index].name[0]) {
-                           thisObject.__AVInputs[index].__InputService.setCharacteristic(Characteristic.IsConfigured, (parseInt(result.rx.cmd[1].functiondelete[0].list[index2].use) == 1 ? Characteristic.IsConfigured.CONFIGURED : Characteristic.IsConfigured.NOT_CONFIGURED));
+                           thisObject.__AVInputs[index].__InputService.setCharacteristic(Characteristic.CurrentVisibilityState, (parseInt(result.rx.cmd[1].functiondelete[0].list[index2].use) == 1 ? Characteristic.CurrentVisibilityState.SHOWN : Characteristic.CurrentVisibilityState.HIDDEN));
+                           thisObject.__AVInputs[index].__InputService.setCharacteristic(Characteristic.TargetVisibilityState, (parseInt(result.rx.cmd[1].functiondelete[0].list[index2].use) == 1 ? Characteristic.CurrentVisibilityState.SHOWN : Characteristic.CurrentVisibilityState.HIDDEN));
                         }
                     } 
-    
-                   thisObject.__AMPService.addLinkedService(DenonAVR.__AVInputs[index].__InputService);
+                    thisObject.__AVInputs[index].__InputService.getCharacteristic(Characteristic.TargetVisibilityState).on('set', thisObject.HomeKitInputStatus.bind(thisObject.__AVInputs[index]));
+                    thisObject.__AMPService.addLinkedService(thisObject.__AVInputs[index].__InputService);
                 }
             });
         }
@@ -343,6 +346,15 @@ DenonClass.prototype = {
         }     
     },
 
+    HomeKitInputStatus: function(state, callback) {
+        // Allow enabling/disble input section in homekit
+        this.__InputService.getCharacteristic(Characteristic.CurrentVisibilityState).updateValue(state);
+        this.__InputService.getCharacteristic(Characteristic.TargetVisibilityState).updateValue(state);
+
+        // TODO
+        // -- if enabling/disablign inputs in HomeKit, refected status on action AMP (if possible)
+        callback();
+    },
 
     refreshHomeKit: function(refreshTimeMS) {
         // setup status check interval as defined
@@ -355,7 +367,12 @@ DenonClass.prototype = {
     },
 
     __DenonStatus: function() {
-        
+        const scale = (num, in_min, in_max, out_min, out_max) => {
+            if (num > out_max) num = out_max;
+            if (num < out_min) num = out_min;
+            return (num - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+        }
+
         thisObject = this;
 
         if (this.__updatingHomeKit == false) {
@@ -365,11 +382,14 @@ DenonClass.prototype = {
                     thisObject.__AMPService.getCharacteristic(Characteristic.Active).updateValue(result.item.Power[0].value[0].toUpperCase() == 'ON' ? Characteristic.Active.ACTIVE : Characteristic.Active.INACTIVE);
 
                     for (var index in thisObject.__AVInputs) {
-                        // search thru the input list to work out which input is to be selected
+                        // search through the input list to work out which input is to be selected
                         if (result.item.InputFuncSelect[0].value[0].toUpperCase() == thisObject.__AVInputs[index].__SelectName.toUpperCase()) {
                             thisObject.__AMPService.getCharacteristic(Characteristic.ActiveIdentifier).updateValue(thisObject.__AVInputs[index].__ID);
                         }
                     }
+                    
+                    // Update speaker volume to reflect what AMP says, scaling from -80.5 <> 18db to 0 <> 100 for HomeKit
+                    thisObject.__SpeakerService.getCharacteristic(Characteristic.Volume).updateValue(scale(parseInt(result.item.MasterVolume[0].value[0]), -80.5, 18, 0, 100));
                 });
             }
         }    
