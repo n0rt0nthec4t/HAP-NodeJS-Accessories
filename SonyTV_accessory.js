@@ -3,7 +3,6 @@
 // https://pro-bravia.sony.net/develop/
 //
 // Mark Hulskamp
-var JSONPackage = require('../package.json')
 var Accessory = require('../').Accessory; 
 var Service = require('../').Service;
 var Characteristic = require('../').Characteristic;
@@ -18,12 +17,16 @@ const SonyTVIP = "x.x.x.x";                                 // IP address for TV
 const SonyTVPSK = "0000";                                   // PSK key
 
 
+// Define some extra remote commands
+Characteristic.RemoteKey.SETTINGS = 101;
+
 
 // Create the TV system object. This can be used as the template for multiple aircons under the one accessory
 function SonyTVClass() {
     this.__accessory = null;                    // Parent accessory object
     this.__TVService = null;                    // HomeKit service for the TV
     this.__SpeakerService = null;               // HomeKit service for the TV speaker
+    this.__RemoteCommands = [];                 // List fo remote commands for this TV
     this.__TVInputs = [];                       // array of input objects.
     this.__timerFunc = null;                    // object to created update loop timer
     this.__waitSetInput = null;                 // cache input if selected while TV is off.. We'll set this input when TV is turned on
@@ -57,7 +60,8 @@ SonyTVClass.prototype = {
         this.__SpeakerService.getCharacteristic(Characteristic.VolumeSelector).on('set', this.setVolume.bind(this));
         this.__TVService.getCharacteristic(Characteristic.PowerModeSelection).on('set', this.accessTVSettings.bind(this));
 
-        // Build list of inputs for both physcial and applicaions
+        // Build list of inputs for both physcial and applicaions        
+        this.__buildRemoteCmdList();
         this.__buildInputList();
         this.__buildApplicationList();
 
@@ -114,88 +118,8 @@ SonyTVClass.prototype = {
     },
 
     setRemoteKey: function(value, callback) {
-        var tempSonyRemoteKey = "";
-        switch (value) {
-            case Characteristic.RemoteKey.REWIND :
-            {
-                tempSonyRemoteKey = 'AAAAAgAAAJcAAAAbAw==';
-                break;
-            }
-
-            case Characteristic.RemoteKey.FAST_FORWARD :
-            {
-                tempSonyRemoteKey = 'AAAAAgAAAJcAAAAcAw==';
-                break;
-            }
-
-            case Characteristic.RemoteKey.NEXT_TRACK :
-            {
-                tempSonyRemoteKey = 'AAAAAgAAAJcAAAA9Aw==';
-                break;
-            }
-
-            case Characteristic.RemoteKey.PREVIOUS_TRACK :
-            {
-                tempSonyRemoteKey = 'AAAAAgAAAJcAAAA8Aw==';
-                break;
-            }
-
-            case Characteristic.RemoteKey.ARROW_UP :
-            {
-                tempSonyRemoteKey = 'AAAAAQAAAAEAAAB0Aw==';
-                break;
-            }
-
-            case Characteristic.RemoteKey.ARROW_DOWN :
-            {
-                tempSonyRemoteKey = 'AAAAAQAAAAEAAAB1Aw==';
-                break;
-            }
-
-            case Characteristic.RemoteKey.ARROW_LEFT :
-            {
-                tempSonyRemoteKey = 'AAAAAQAAAAEAAAA0Aw==';
-                break;
-            }
-
-            case Characteristic.RemoteKey.ARROW_RIGHT :
-            {
-                tempSonyRemoteKey = 'AAAAAQAAAAEAAAAzAw==';
-                break;
-            }
-            case Characteristic.RemoteKey.SELECT : 
-            {
-                tempSonyRemoteKey = 'AAAAAQAAAAEAAABlAw==';
-                break;
-            }
-
-            case Characteristic.RemoteKey.BACK :
-            {
-                tempSonyRemoteKey = 'AAAAAgAAAJcAAAAjAw==';
-                break;
-            }
-
-            case Characteristic.RemoteKey.EXIT :
-            {
-                tempSonyRemoteKey = 'AAAAAQAAAAEAAABjAw==';
-                break;
-            }
-
-            case Characteristic.RemoteKey.PLAY_PAUSE :
-            {
-                //Play”	“AAAAAgAAAJcAAAAaAw==”
-                //“Pause”	“AAAAAgAAAJcAAAAZAw==”
-                break;
-            }
-
-            case Characteristic.RemoteKey.INFORMATION :
-            {
-                tempSonyRemoteKey = 'AAAAAQAAAAEAAAA6Aw==';
-                break;
-            }
-        }
-        if (tempSonyRemoteKey != "") {
-            var IRCCBodyRequest = '<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><u:X_SendIRCC xmlns:u="urn:schemas-sony-com:service:IRCC:1"><IRCCCode>' + tempSonyRemoteKey + '</IRCCCode></u:X_SendIRCC></s:Body></s:Envelope>';
+        if (this.__RemoteCommands[value] !== "undefined" && this.__RemoteCommands[value] != "") {
+            var IRCCBodyRequest = '<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><u:X_SendIRCC xmlns:u="urn:schemas-sony-com:service:IRCC:1"><IRCCCode>' + this.__RemoteCommands[value] + '</IRCCCode></u:X_SendIRCC></s:Body></s:Envelope>';
             var response = request("POST", "http://" + SonyTVIP + "/sony/IRCC", {headers: {"X-Auth-PSK": SonyTVPSK, "Content-Type": "text/xml", "soapaction": '"urn:schemas-sony-com:service:IRCC:1#X_SendIRCC"'}, body: IRCCBodyRequest });
             if (response.statusCode == 200) {
                 callback(); // set input
@@ -209,14 +133,109 @@ SonyTVClass.prototype = {
     },
 
     accessTVSettings: function(value, callback) {
-        if (value == Characteristic.PowerModeSelection.SHOW) {
-            var IRCCBodyRequest = '<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><u:X_SendIRCC xmlns:u="urn:schemas-sony-com:service:IRCC:1"><IRCCCode>AAAAAgAAAMQAAABLAw==</IRCCCode></u:X_SendIRCC></s:Body></s:Envelope>';
+        if (value == Characteristic.PowerModeSelection.SHOW && this.__RemoteCommands[Characteristic.RemoteKey.SETTINGS] !== "undefined" && this.__RemoteCommands[Characteristic.RemoteKey.SETTINGS] != "") {
+            var IRCCBodyRequest = '<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><u:X_SendIRCC xmlns:u="urn:schemas-sony-com:service:IRCC:1"><IRCCCode>' + this.__RemoteCommands[Characteristic.RemoteKey.SETTINGS] + '</IRCCCode></u:X_SendIRCC></s:Body></s:Envelope>';
             var response = request("POST", "http://" + SonyTVIP + "/sony/IRCC", {headers: {"X-Auth-PSK": SonyTVPSK, "Content-Type": "text/xml", "soapaction": '"urn:schemas-sony-com:service:IRCC:1#X_SendIRCC"'}, body: IRCCBodyRequest });
         }
-        //Home	AAAAAQAAAAEAAABgAw==
-        //Options	AAAAAgAAAJcAAAA2Aw==
-        //ActionMenu	AAAAAgAAAMQAAABLAw==
         callback();
+    },
+
+    __buildRemoteCmdList: function() {
+        // Create mapping of available remote commands so we can use in HomeKit remote app
+        var response = request("POST", "http://" + SonyTVIP + "/sony/system", {headers: {"X-Auth-PSK": SonyTVPSK}, json: {"method": "getRemoteControllerInfo", "id": 1, "params": [""],  "version": "1.0"} });
+        if (response.statusCode == 200 && typeof JSON.parse(response.body).result !== 'undefined') {
+            var tempRemoteList = JSON.parse(response.body).result[1];
+            this.__RemoteCommands = [];
+            for (var index in tempRemoteList) {
+                switch (tempRemoteList[index].name.toUpperCase()) {
+                    case "REWIND" :
+                    {
+                        this.__RemoteCommands[Characteristic.RemoteKey.REWIND] = tempRemoteList[index].value;
+                        break;
+                    }
+
+                    case "FORWARD" :
+                    {
+                        this.__RemoteCommands[Characteristic.RemoteKey.FAST_FORWARD] = tempRemoteList[index].value;
+                        break;
+                    }
+
+
+                    case "NEXT" :
+                    {
+                        this.__RemoteCommands[Characteristic.RemoteKey.NEXT_TRACK] = tempRemoteList[index].value;
+                        break;
+                    }
+
+                    case "PREV" :
+                    {
+                        this.__RemoteCommands[Characteristic.RemoteKey.PREVIOUS_TRACK] = tempRemoteList[index].value;
+                        break;
+                    }
+
+                    case "UP" :
+                    {
+                        this.__RemoteCommands[Characteristic.RemoteKey.ARROW_UP] = tempRemoteList[index].value;
+                        break;
+                    }
+
+                    case "DOWN" :
+                    {
+                        this.__RemoteCommands[Characteristic.RemoteKey.ARROW_DOWN] = tempRemoteList[index].value;
+                        break;
+                    }
+
+                    case "LEFT" :
+                    {
+                        this.__RemoteCommands[Characteristic.RemoteKey.ARROW_LEFT] = tempRemoteList[index].value;
+                        break;
+                    }
+
+                    case "RIGHT" :
+                    {
+                        this.__RemoteCommands[Characteristic.RemoteKey.ARROW_RIGHT] = tempRemoteList[index].value;
+                        break;
+                    }
+
+                    case "CONFIRM" :
+                    {
+                        this.__RemoteCommands[Characteristic.RemoteKey.SELECT] = tempRemoteList[index].value;
+                        break;
+                    }
+
+                    case "RETURN" :
+                    {
+                        this.__RemoteCommands[Characteristic.RemoteKey.BACK] = tempRemoteList[index].value;
+                        break;
+                    }
+
+                    case "EXIT" :
+                    {
+                        this.__RemoteCommands[Characteristic.RemoteKey.EXIT] = tempRemoteList[index].value;
+                        break;
+                    }
+
+                    case "PLAY" :
+                    case "PAUSE" :
+                    {
+                        //tempSonyRemoteKeys[Characteristic.RemoteKey.PLAY_PAUSE] = tempRemoteList[index].value;
+                        break;
+                    }
+
+                    case "DISPLAY" :
+                    {
+                        this.__RemoteCommands[Characteristic.RemoteKey.INFORMATION] = tempRemoteList[index].value;
+                        break;
+                    }
+
+                    case "ACTIONMENU" :
+                    {
+                        this.__RemoteCommands[Characteristic.RemoteKey.SETTINGS] = tempRemoteList[index].value;
+                        break;
+                    }
+                }
+            }
+        } 
     },
 
     __buildInputList: function() {
@@ -386,9 +405,8 @@ if (response.statusCode == 200 && typeof JSON.parse(response.body).result !== 'u
     SonyTV.__accessory.getService(Service.AccessoryInformation).setCharacteristic(Characteristic.Manufacturer, "Sony");
     SonyTV.__accessory.getService(Service.AccessoryInformation).setCharacteristic(Characteristic.Model, SonyTVSystemInfo.model);
     SonyTV.__accessory.getService(Service.AccessoryInformation).setCharacteristic(Characteristic.SerialNumber, SonyTVSystemInfo.serial);
-    SonyTV.__accessory.getService(Service.AccessoryInformation).setCharacteristic(Characteristic.FirmwareRevision, JSONPackage.version);
+    SonyTV.__accessory.getService(Service.AccessoryInformation).setCharacteristic(Characteristic.FirmwareRevision, SonyTVSystemInfo.generation);
 
-    
     SonyTV.addTelevison(SonyTV.__accessory, AccessoryName, 1);
     SonyTV.refreshHomeKit(2000);    // Refresh HomeKit every 2 seconds
 } else {
