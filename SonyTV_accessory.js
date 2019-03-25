@@ -2,6 +2,13 @@
 // 
 // https://pro-bravia.sony.net/develop/
 //
+// todo 
+// -- Build list of applications on TV as HomeKit inputs
+// -- Dynamic removal/addition of inputs into HomeKit
+// -- Remote play/pause functionallity
+//
+// done
+//
 // Mark Hulskamp
 var Accessory = require('../').Accessory; 
 var Service = require('../').Service;
@@ -13,12 +20,13 @@ var request = require('sync-request');
 const AccessoryName =  "Television";                        // name of accessory
 const AccessoryPincode = "031-45-154";                      // pin code for paring  
 
-const SonyTVIP = "x.x.x.x";                                 // IP address for TV
+const SonyTVIP = "10.0.1.104";                              // IP address for TV
 const SonyTVPSK = "0000";                                   // PSK key
-
 
 // Define some extra remote commands
 Characteristic.RemoteKey.SETTINGS = 101;
+Characteristic.RemoteKey.PLAY = 102;
+Characteristic.RemoteKey.PAUSE = 102;
 
 
 // Create the TV system object. This can be used as the template for multiple aircons under the one accessory
@@ -51,7 +59,6 @@ SonyTVClass.prototype = {
         // Add the TV speaker as a service
         this.__SpeakerService = HomeKitAccessory.addService(Service.TelevisionSpeaker);
         this.__SpeakerService.setCharacteristic(Characteristic.VolumeControlType, Characteristic.VolumeControlType.ABSOLUTE);
-        //this.__SpeakerService.setCharacteristic(Characteristic.VolumeControlType, Characteristic.VolumeControlType.RELATIVE_WITH_CURRENT);
 
         // Setup call backs
         this.__TVService.getCharacteristic(Characteristic.Active).on('set', this.setPowerState.bind(this));
@@ -62,8 +69,7 @@ SonyTVClass.prototype = {
 
         // Build list of inputs for both physcial and applicaions        
         this.__buildRemoteCmdList();
-        this.__buildInputList();
-        this.__buildApplicationList();
+        this.__buildInputList(false);
 
         // Force HomeKit update for inital state
         this.__SonyTVStatus();
@@ -121,15 +127,13 @@ SonyTVClass.prototype = {
         if (this.__RemoteCommands[value] !== "undefined" && this.__RemoteCommands[value] != "") {
             var IRCCBodyRequest = '<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><u:X_SendIRCC xmlns:u="urn:schemas-sony-com:service:IRCC:1"><IRCCCode>' + this.__RemoteCommands[value] + '</IRCCCode></u:X_SendIRCC></s:Body></s:Envelope>';
             var response = request("POST", "http://" + SonyTVIP + "/sony/IRCC", {headers: {"X-Auth-PSK": SonyTVPSK, "Content-Type": "text/xml", "soapaction": '"urn:schemas-sony-com:service:IRCC:1#X_SendIRCC"'}, body: IRCCBodyRequest });
-            if (response.statusCode == 200) {
-                callback(); // set input
-            }
         }
+        callback(); // sent remote command
     },
 
     setVolume: function(value, callback) {
         var response = request("POST", "http://" + SonyTVIP + "/sony/audio", {headers: {"X-Auth-PSK": SonyTVPSK}, json: {"method": "setAudioVolume", "id": 601, "params": [{"target": "speaker", "volume": (value == Characteristic.VolumeSelector.INCREMENT ? "+1" : "-1")}],  "version": "1.0"} });
-        callback();
+        callback(); // set volume
     },
 
     accessTVSettings: function(value, callback) {
@@ -137,7 +141,7 @@ SonyTVClass.prototype = {
             var IRCCBodyRequest = '<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><u:X_SendIRCC xmlns:u="urn:schemas-sony-com:service:IRCC:1"><IRCCCode>' + this.__RemoteCommands[Characteristic.RemoteKey.SETTINGS] + '</IRCCCode></u:X_SendIRCC></s:Body></s:Envelope>';
             var response = request("POST", "http://" + SonyTVIP + "/sony/IRCC", {headers: {"X-Auth-PSK": SonyTVPSK, "Content-Type": "text/xml", "soapaction": '"urn:schemas-sony-com:service:IRCC:1#X_SendIRCC"'}, body: IRCCBodyRequest });
         }
-        callback();
+        callback(); // accessed TV settings
     },
 
     __buildRemoteCmdList: function() {
@@ -159,7 +163,6 @@ SonyTVClass.prototype = {
                         this.__RemoteCommands[Characteristic.RemoteKey.FAST_FORWARD] = tempRemoteList[index].value;
                         break;
                     }
-
 
                     case "NEXT" :
                     {
@@ -215,10 +218,14 @@ SonyTVClass.prototype = {
                         break;
                     }
 
-                    case "PLAY" :
+                    case "PLAY" : {
+                        tempSonyRemoteKeys[Characteristic.RemoteKey.PLAY] = tempRemoteList[index].value;
+                        break;
+                    }
+
                     case "PAUSE" :
                     {
-                        //tempSonyRemoteKeys[Characteristic.RemoteKey.PLAY_PAUSE] = tempRemoteList[index].value;
+                        tempSonyRemoteKeys[Characteristic.RemoteKey.PAUSE] = tempRemoteList[index].value;
                         break;
                     }
 
@@ -238,81 +245,113 @@ SonyTVClass.prototype = {
         } 
     },
 
-    __buildInputList: function() {
+    __buildInputList: function(includeChannels) {
         // Build and setup HomeKit objects for the available inputs on the TV
         var response = request("POST", "http://" + SonyTVIP + "/sony/avContent", {headers: {"X-Auth-PSK": SonyTVPSK}, json: {"method": "getCurrentExternalInputsStatus", "id": 105, "params": [""], "version": "1.0"} });
         if (response.statusCode == 200 && typeof JSON.parse(response.body).result !== 'undefined') {
             var tempInputList = JSON.parse(response.body).result[0];
+            var inputIndex = 0;
             for (var index in tempInputList) {
-                this.__TVInputs[index] = new InputClass();
-                this.__TVInputs[index].__InputService = this.__accessory.addService(Service.InputSource, tempInputList[index].title, index);
-                this.__TVInputs[index].__uri = tempInputList[index].uri;
-                this.__TVInputs[index].__ID = index;
+                this.__TVInputs[inputIndex] = new InputClass();
+                this.__TVInputs[inputIndex].__InputService = this.__accessory.addService(Service.InputSource, tempInputList[index].title, inputIndex);
+                this.__TVInputs[inputIndex].__uri = tempInputList[index].uri;
+                this.__TVInputs[inputIndex].__ID = inputIndex;
 
                 if (tempInputList[index].label != "") {
-                    this.__TVInputs[index].__InputService.setCharacteristic(Characteristic.ConfiguredName, tempInputList[index].title + " (" + tempInputList[index].label + ")");
+                    this.__TVInputs[inputIndex].__InputService.setCharacteristic(Characteristic.ConfiguredName, tempInputList[index].title + " (" + tempInputList[index].label + ")");
                 }
     
-                this.__TVInputs[index].__InputService.setCharacteristic(Characteristic.IsConfigured, Characteristic.IsConfigured.CONFIGURED);
-                this.__TVInputs[index].__InputService.setCharacteristic(Characteristic.CurrentVisibilityState, Characteristic.CurrentVisibilityState.SHOWN);
-                this.__TVInputs[index].__InputService.setCharacteristic(Characteristic.TargetVisibilityState, Characteristic.CurrentVisibilityState.SHOWN);    
-                this.__TVInputs[index].__InputService.setCharacteristic(Characteristic.Identifier, index);
+                this.__TVInputs[inputIndex].__InputService.setCharacteristic(Characteristic.IsConfigured, Characteristic.IsConfigured.CONFIGURED);
+                this.__TVInputs[inputIndex].__InputService.setCharacteristic(Characteristic.CurrentVisibilityState, Characteristic.CurrentVisibilityState.SHOWN);
+                this.__TVInputs[inputIndex].__InputService.setCharacteristic(Characteristic.TargetVisibilityState, Characteristic.CurrentVisibilityState.SHOWN);    
+                this.__TVInputs[inputIndex].__InputService.setCharacteristic(Characteristic.Identifier, inputIndex);
 
                 // Determine the input type by the "icon" tag. Split after the "meta:" entry for the type
                 switch(tempInputList[index].icon.split(":")[1].toUpperCase())
                 {
                     case "HDMI" :
                     {
-                        this.__TVInputs[index].__InputService.setCharacteristic(Characteristic.InputSourceType, Characteristic.InputSourceType.HDMI);
+                        this.__TVInputs[inputIndex].__InputService.setCharacteristic(Characteristic.InputSourceType, Characteristic.InputSourceType.HDMI);
                         break
                     }
 
                     case "COMPONENT" :
                     {
-                        this.__TVInputs[index].__InputService.setCharacteristic(Characteristic.InputSourceType, Characteristic.InputSourceType.COMPONENT_VIDEO);
+                        this.__TVInputs[inputIndex].__InputService.setCharacteristic(Characteristic.InputSourceType, Characteristic.InputSourceType.COMPONENT_VIDEO);
                         break
                     }
 
                     case "COMPOSITE" :
                     {
-                        this.__TVInputs[index].__InputService.setCharacteristic(Characteristic.InputSourceType, Characteristic.InputSourceType.COMPOSITE_VIDEO);
+                        this.__TVInputs[inputIndex].__InputService.setCharacteristic(Characteristic.InputSourceType, Characteristic.InputSourceType.COMPOSITE_VIDEO);
                         break
                     }
 
                     case "SVIDEO" :
                     {
-                        this.__TVInputs[index].__InputService.setCharacteristic(Characteristic.InputSourceType, Characteristic.InputSourceType.S_VIDEO);
+                        this.__TVInputs[inputIndex].__InputService.setCharacteristic(Characteristic.InputSourceType, Characteristic.InputSourceType.S_VIDEO);
                         break
                     }
 
                     case "WIFIDISPLAY" :
                     {
-                        this.__TVInputs[index].__InputService.setCharacteristic(Characteristic.InputSourceType, Characteristic.InputSourceType.AIRPLAY);
+                        this.__TVInputs[inputIndex].__InputService.setCharacteristic(Characteristic.InputSourceType, Characteristic.InputSourceType.AIRPLAY);
                         break
                     }
                 }
-                this.__TVInputs[index].__InputService.getCharacteristic(Characteristic.TargetVisibilityState).on('set', this.HomeKitInputStatus.bind(this.__TVInputs[index]));
-                this.__TVService.addLinkedService(this.__TVInputs[index].__InputService);
+                this.__TVInputs[inputIndex].__InputService.getCharacteristic(Characteristic.TargetVisibilityState).on('set', this.HomeKitInputStatus.bind(this.__TVInputs[inputIndex]));
+                this.__TVService.addLinkedService(this.__TVInputs[inputIndex].__InputService);
+                inputIndex++;
             }
             
-            // Add an input(s) for any tuners. This doesnt appear in the list of external inputs, so we use another call to see whats defined        
+            // Add input(s) for any tuners. These dont appear in the list of external inputs, so we use another call to see whats defined        
             var response = request("POST", "http://" + SonyTVIP + "/sony/avContent", {headers: {"X-Auth-PSK": SonyTVPSK}, json: {"method": "getSourceList", "id": 1, "params": [{"scheme": "tv"}], "version": "1.0"} });
             if (response.statusCode == 200 && typeof JSON.parse(response.body).result !== 'undefined') {
                 var tempInputList = JSON.parse(response.body).result[0];
-                for (var index2 in tempInputList) {
-                    index++;    // Use index from previous input list loop to increase here
-                    this.__TVInputs[index] = new InputClass();
-                    this.__TVInputs[index].__InputService = this.__accessory.addService(Service.InputSource, (tempInputList[index2].source.substr(0,4).toUpperCase() == "TV:D" ? "Digital Tuner" : "Tuner"), index);
-                    this.__TVInputs[index].__uri = tempInputList[index2].source;
-                    this.__TVInputs[index].__ID = index;
-                    this.__TVInputs[index].__InputService.setCharacteristic(Characteristic.InputSourceType, Characteristic.InputSourceType.TUNER);
-                    this.__TVInputs[index].__InputService.setCharacteristic(Characteristic.IsConfigured, Characteristic.IsConfigured.CONFIGURED);
-                    this.__TVInputs[index].__InputService.setCharacteristic(Characteristic.CurrentVisibilityState, Characteristic.CurrentVisibilityState.SHOWN);
-                    this.__TVInputs[index].__InputService.setCharacteristic(Characteristic.TargetVisibilityState, Characteristic.CurrentVisibilityState.SHOWN);
-                    this.__TVInputs[index].__InputService.setCharacteristic(Characteristic.Identifier, index);
-                    this.__TVInputs[index].__InputService.getCharacteristic(Characteristic.TargetVisibilityState).on('set', this.HomeKitInputStatus.bind(this.__TVInputs[index]));
-                    this.__TVService.addLinkedService(this.__TVInputs[index].__InputService);
+                for (var index in tempInputList) {
+                    var tempInputName = "Tuner";
+                    if (tempInputList[index].source.toUpperCase() == "TV:DVBT") tempInputName = "Digital Tuner";
+                    if (tempInputList[index].source.toUpperCase() == "TV:DVBC") tempInputName = "Cable Tuner";
+                    if (tempInputList[index].source.toUpperCase() == "TV:DVBS") tempInputName = "Satellite Tuner";
+                    this.__TVInputs[inputIndex] = new InputClass();
+                    this.__TVInputs[inputIndex].__InputService = this.__accessory.addService(Service.InputSource, tempInputName, inputIndex);
+                    this.__TVInputs[inputIndex].__uri = tempInputList[index].source;
+                    this.__TVInputs[inputIndex].__ID = inputIndex;
+                    this.__TVInputs[inputIndex].__InputService.setCharacteristic(Characteristic.InputSourceType, Characteristic.InputSourceType.TUNER);
+                    this.__TVInputs[inputIndex].__InputService.setCharacteristic(Characteristic.IsConfigured, Characteristic.IsConfigured.CONFIGURED);
+                    this.__TVInputs[inputIndex].__InputService.setCharacteristic(Characteristic.CurrentVisibilityState, Characteristic.CurrentVisibilityState.SHOWN);
+                    this.__TVInputs[inputIndex].__InputService.setCharacteristic(Characteristic.TargetVisibilityState, Characteristic.CurrentVisibilityState.SHOWN);
+                    this.__TVInputs[inputIndex].__InputService.setCharacteristic(Characteristic.Identifier, inputIndex);
+                    this.__TVInputs[inputIndex].__InputService.getCharacteristic(Characteristic.TargetVisibilityState).on('set', this.HomeKitInputStatus.bind(this.__TVInputs[inputIndex]));
+                    this.__TVService.addLinkedService(this.__TVInputs[inputIndex].__InputService);
+                    inputIndex++;
+
+                    // See if we've been asked to include channels for this tuner as inputs in HomeKit
+                    // Seems if there are alot of channels, does slow down interacting with the accesssory settings intially in HomeKit
+                    if (includeChannels == true) {
+                        var response = request("POST", "http://" + SonyTVIP + "/sony/avContent", {headers: {"X-Auth-PSK": SonyTVPSK}, json: {"method": "getContentList", "id": 2, "params": [{"source": tempInputList[index].source, "stIx": 0}], "version": "1.2"} });
+                        if (response.statusCode == 200 && typeof JSON.parse(response.body).result !== 'undefined') {
+                            var tempChannelList = JSON.parse(response.body).result[0];
+                            for (var index2 in tempChannelList) {
+                                this.__TVInputs[inputIndex] = new InputClass();
+                                this.__TVInputs[inputIndex].__InputService = this.__accessory.addService(Service.InputSource, tempChannelList[index2].title, inputIndex);
+                                this.__TVInputs[inputIndex].__uri = tempChannelList[index2].uri;
+                                this.__TVInputs[inputIndex].__ID = inputIndex;
+                                this.__TVInputs[inputIndex].__InputService.setCharacteristic(Characteristic.InputSourceType, Characteristic.InputSourceType.OTHER); // Maybe Characteristic.InputSourceType.APPLICATION??
+                                this.__TVInputs[inputIndex].__InputService.setCharacteristic(Characteristic.IsConfigured, Characteristic.IsConfigured.CONFIGURED);
+                                this.__TVInputs[inputIndex].__InputService.setCharacteristic(Characteristic.CurrentVisibilityState, Characteristic.CurrentVisibilityState.SHOWN);
+                                this.__TVInputs[inputIndex].__InputService.setCharacteristic(Characteristic.TargetVisibilityState, Characteristic.CurrentVisibilityState.SHOWN);
+                                this.__TVInputs[inputIndex].__InputService.setCharacteristic(Characteristic.Identifier, inputIndex);
+                                this.__TVInputs[inputIndex].__InputService.getCharacteristic(Characteristic.TargetVisibilityState).on('set', this.HomeKitInputStatus.bind(this.__TVInputs[inputIndex]));
+                                this.__TVService.addLinkedService(this.__TVInputs[inputIndex].__InputService);
+                                inputIndex++;
+                            }
+                        }
+                    }
                 }
+
+                // Build application list
+                // TODO
             }
         }
         else {
@@ -325,10 +364,6 @@ SonyTVClass.prototype = {
         this.__InputService.getCharacteristic(Characteristic.CurrentVisibilityState).updateValue(state);
         this.__InputService.getCharacteristic(Characteristic.TargetVisibilityState).updateValue(state);
         callback();
-    },
-
-    __buildApplicationList: function() {
-        // TODO
     },
 
     refreshHomeKit: function(refreshTimeMS) {
@@ -355,7 +390,7 @@ SonyTVClass.prototype = {
                 this.__TVService.getCharacteristic(Characteristic.Active).updateValue((JSON.parse(response.body).result[0].status.toUpperCase() == "ACTIVE" ? Characteristic.Active.ACTIVE : Characteristic.Active.INACTIVE));
 
                 if (JSON.parse(response.body).result[0].status.toUpperCase() == "ACTIVE" && this.__waitSetInput != null) {
-                    // TVs been switched on externally to HomeKit and we have an "cached input value. We'll clear the cached value in this case and let teh loop below update the current state
+                    // TVs been switched on externally to HomeKit and we have an "cached input value. We'll clear the cached value in this case and let the loop below update the current state
                     this.__waitSetInput = null;
                 }
             }
@@ -367,7 +402,7 @@ SonyTVClass.prototype = {
             if (response.statusCode == 200 && typeof JSON.parse(response.body).result !== 'undefined') {
                 for (var index in this.__TVInputs) {
                     // search thru the input list to work out which input is to be selected
-                    if ((JSON.parse(response.body).result[0].uri == this.__TVInputs[index].__uri) || (JSON.parse(response.body).result[0].source == "tv:dvbt" && JSON.parse(response.body).result[0].source == this.__TVInputs[index].__uri)) {
+                    if ((JSON.parse(response.body).result[0].uri == this.__TVInputs[index].__uri) || (JSON.parse(response.body).result[0].source.substr(0,6).toUpperCase() == "TV:DVB" && JSON.parse(response.body).result[0].source == this.__TVInputs[index].__uri)) {
                         this.__TVService.getCharacteristic(Characteristic.ActiveIdentifier).updateValue(this.__TVInputs[index].__ID);
                     }
                 }
