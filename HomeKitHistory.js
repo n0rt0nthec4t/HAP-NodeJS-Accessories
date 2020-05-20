@@ -375,7 +375,7 @@ var numToHex = function (val, len) {
 
 HomeKitHistory.prototype.linkToEveHome = function(HomeKitAccessory, service) {
     // Overlay our history into EveHome. Can only have one service history exposed to EveHome (ATM... see if can work around)
-    if (this.EveHome && this.EveHome.hasOwnProperty("service") == false) {
+    if (typeof this.EveHome == "undefined" || (this.EveHome && this.EveHome.hasOwnProperty("service") == false)) {
         this.EveHome = {};  // initialise our object for tracking data to EveHome
         var tempService = HomeKitAccessory.addService(Service.EveHomeHistory, "", 1);
 
