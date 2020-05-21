@@ -4,6 +4,7 @@
 // todo
 // -- import history for sprinkler/irrigation systems to EveHome (Aqua)
 // -- get humidity recordings for EveHome thermo
+// -- get history to show for EveHoem motion 
 // -- notify Eve when new history entries added
 //
 // done
@@ -85,12 +86,22 @@ HomeKitHistory.prototype.addHistory = function(service, entry) {
             break;
         }
 
+        case Service.MotionSensor.UUID : {
+            // Motion sensor history
+            // entry.time => unix time in seconds
+            // entry.status => 1 = motion detected, 0 = motion cleared
+            historyEntry.status = entry.status;
+            if (typeof entry.restart != "undefined") historyEntry.restart = entry.restart;
+            this.__addEntry(service.UUID, service.subtype, entry.time, historyEntry);
+            break;
+        }
+
         case Service.Window.UUID :
         case Service.WindowCovering.UUID : {
             // Window and Window Covering history
             // entry.time => unix time in seconds
             // entry.status => 1 = open, 0 = closed
-            // entry.position => position %
+            // entry.position => position in % 0% = closed 100% fully open
             historyEntry.status = entry.status;
             historyEntry.position = entry.position;
             if (typeof entry.restart != "undefined") historyEntry.restart = entry.restart;
@@ -340,6 +351,7 @@ HomeKitHistory.prototype.__updateHistoryTypes = function() {
 
 // Overlay EveHome service, characteristics and functions
 // Alot of code taken from fakegato https://github.com/simont77/fakegato-history
+// references from https://github.com/ebaauw/homebridge-lib/blob/master/lib/EveHomeKitTypes.js
 var hexToBase64 = function (val) {
 	return new Buffer(('' + val).replace(/[^0-9A-F]/ig, ''), 'hex').toString('base64');
 }
@@ -377,7 +389,7 @@ HomeKitHistory.prototype.linkToEveHome = function(HomeKitAccessory, service) {
     // Overlay our history into EveHome. Can only have one service history exposed to EveHome (ATM... see if can work around)
     if (typeof this.EveHome == "undefined" || (this.EveHome && this.EveHome.hasOwnProperty("service") == false)) {
         this.EveHome = {};  // initialise our object for tracking data to EveHome
-        var tempService = HomeKitAccessory.addService(Service.EveHomeHistory, "", 1);
+        var historyService = HomeKitAccessory.addService(Service.EveHomeHistory, "", 1);
 
         var tempHistory = this.getHistory(service.UUID, service.subtype);
         var historyreftime = (tempHistory.length == 0 ? (this.historyData.reset - EPOCH_OFFSET) : (tempHistory[0].time - EPOCH_OFFSET));
@@ -389,122 +401,91 @@ HomeKitHistory.prototype.linkToEveHome = function(HomeKitAccessory, service) {
             case Service.WindowCovering.UUID : 
             case Service.GarageDoorOpener.UUID : {
                 // treat these as EveHome Door but with inverse status for open/closed
-                this.EveHome = {service: tempService, type: service.UUID, sub: service.subtype, evetype: "door", signature1: "01 0601", signature2: "01", transfer: false, entry: 0, count: entrycount, reftime: historyreftime, send: 0};
+                this.EveHome = {service: historyService, type: service.UUID, sub: service.subtype, evetype: "door", signature1: "01 0601", signature2: "01", transfer: false, entry: 0, count: entrycount, reftime: historyreftime, send: 0};
                 service.addCharacteristic(Characteristic.EveLastActivation);
                 service.addCharacteristic(Characteristic.EveOpenDuration);
                 service.addCharacteristic(Characteristic.EveClosedDuration);
                 service.addCharacteristic(Characteristic.EveTimesOpened);
 
-                // Perform initial update to characteritics
+                // Setup initial values and callbacks for charateristics we are using
                 service.getCharacteristic(Characteristic.EveTimesOpened).updateValue(this.entryCount(this.EveHome.type, this.EveHome.sub, {status: 1}));   // Count of entries based upon status = 1, opened
-            
-                // calculate time in seconds since first event to last event. If no history we'll use the current time as the last event time
-                var lastTime = Math.floor(new Date() / 1000) - (this.EveHome.reftime + EPOCH_OFFSET);
-                if (tempHistory.length != 0) {
-                    lastTime -= (Math.floor(new Date() / 1000) - tempHistory[tempHistory.length - 1].time);
-                }
-                service.getCharacteristic(Characteristic.EveLastActivation).updateValue(lastTime);
-
-                // Setup some callbacks for Characteristics we want to report back on
+                service.getCharacteristic(Characteristic.EveLastActivation).updateValue(this.__EveLastEventTime());
                 service.getCharacteristic(Characteristic.EveTimesOpened).on("get", (callback) => {
-                    // Count of entries based upon status = 1, opened
-                    callback(null, this.entryCount(this.EveHome.type, this.EveHome.sub, {status: 1}));
+                    callback(null, this.entryCount(this.EveHome.type, this.EveHome.sub, {status: 1}));  // Count of entries based upon status = 1, opened
                 });
-
                 service.getCharacteristic(Characteristic.EveLastActivation).on("get", (callback) => {
-                    // calculate time in seconds since first event to last event. If no history we'll use the current time as the last event time
-                    var historyEntry = this.lastHistory(this.EveHome.type, this.EveHome.sub);
-                    var lastTime = Math.floor(new Date() / 1000) - (this.EveHome.reftime + EPOCH_OFFSET);
-                    if (historyEntry && Object.keys(historyEntry).length != 0) {
-                        lastTime -= (Math.floor(new Date() / 1000) - historyEntry.time);
-                    }
-                    callback(null, lastTime);
-                });
+                    callback(null, this.__EveLastEventTime());  // time of last event
+                }); 
                 break;
             }
 
             case Service.ContactSensor.UUID : {
                 // treat these as EveHome Door 
-                this.EveHome = {service: tempService, type: service.UUID, sub: service.subtype, evetype: "contact", signature1: "01 0601", signature2: "01", transfer: false, entry: 0, count: entrycount, reftime: historyreftime, send: 0};
+                this.EveHome = {service: historyService, type: service.UUID, sub: service.subtype, evetype: "contact", signature1: "01 0601", signature2: "01", transfer: false, entry: 0, count: entrycount, reftime: historyreftime, send: 0};
                 service.addCharacteristic(Characteristic.EveLastActivation);
                 service.addCharacteristic(Characteristic.EveOpenDuration);
                 service.addCharacteristic(Characteristic.EveClosedDuration);
                 service.addCharacteristic(Characteristic.EveTimesOpened);
 
-                // Perform initial update to characteritics
+                // Setup initial values and callbacks for charateristics we are using
                 service.getCharacteristic(Characteristic.EveTimesOpened).updateValue(this.entryCount(this.EveHome.type, this.EveHome.sub, {status: 1}));   // Count of entries based upon status = 1, opened
-                
-                // calculate time in seconds since first event to last event. If no history we'll use the current time as the last event time
-                var lastTime = Math.floor(new Date() / 1000) - (this.EveHome.reftime + EPOCH_OFFSET);
-                if (tempHistory.length != 0) {
-                    lastTime -= (Math.floor(new Date() / 1000) - tempHistory[tempHistory.length - 1].time);
-                }
-                service.getCharacteristic(Characteristic.EveLastActivation).updateValue(lastTime);
-
-                // Setup some callbacks for Characteristics we want to report back on
+                service.getCharacteristic(Characteristic.EveLastActivation).updateValue(this.__EveLastEventTime());
                 service.getCharacteristic(Characteristic.EveTimesOpened).on("get", (callback) => {
-                    // Count of entries based upon status = 1, opened
-                    callback(null, this.entryCount(this.EveHome.type, this.EveHome.sub, {status: 1}));
+                    callback(null, this.entryCount(this.EveHome.type, this.EveHome.sub, {status: 1})); // Count of entries based upon status = 1, opened
                 });
-
                 service.getCharacteristic(Characteristic.EveLastActivation).on("get", (callback) => {
-                    // calculate time in seconds since first event to last event. If no history we'll use the current time as the last event time
-                    var historyEntry = this.lastHistory(this.EveHome.type, this.EveHome.sub);
-                    var lastTime = Math.floor(new Date() / 1000) - (this.EveHome.reftime + EPOCH_OFFSET);
-                    if (historyEntry && Object.keys(historyEntry).length != 0) {
-                        lastTime -= (Math.floor(new Date() / 1000) - historyEntry.time);
-                    }
-                    callback(null, lastTime);
-                });        
+                    callback(null, this.__EveLastEventTime());   // time of last event
+                });  
                 break;
             }
 
             case Service.HeaterCooler.UUID :
             case Service.Thermostat.UUID : {
                 // treat these as EveHome Thermo
-                this.EveHome = {service: tempService, type: service.UUID, sub: service.subtype, evetype: "thermo", signature1: "05 0102 1102 1001 1201 1d01", signature2: "1f", transfer: false, entry: 0, count: entrycount, reftime: historyreftime, send: 0}; 
+                this.EveHome = {service: historyService, type: service.UUID, sub: service.subtype, evetype: "thermo", signature1: "05 0102 1102 1001 1201 1d01", signature2: "1f", transfer: false, entry: 0, count: entrycount, reftime: historyreftime, send: 0}; 
                 service.addCharacteristic(Characteristic.EveValvePosition);   // Needed to show history for thermostating heating modes (valve position)
-               /* service.addCharacteristic(Characteristic.EveProgramCommand);
-                service.addCharacteristic(Characteristic.EveProgramData);
-
-                service.getCharacteristic(Characteristic.EveProgramData).on("get", (callback) => {
-                    callback(null, "ff04f6");   // Schedule disabled
-                })
-
-                service.getCharacteristic(Characteristic.EveProgramCommand).on("set", (value, callback) => {
-                    callback(null,value);
-                }) */
                 break;
             }
 
             case Service.TemperatureSensor.UUID : {
                 // treat these as EveHome Room
-                this.EveHome = {service: tempService, type: service.UUID, sub: service.subtype, evetype: "room", signature1: "04 0102 0202 0402 0f03", signature2: "0f", transfer: false, entry: 0, count: entrycount, reftime: historyreftime, send: 0};
+                this.EveHome = {service: historyService, type: service.UUID, sub: service.subtype, evetype: "room", signature1: "04 0102 0202 0402 0f03", signature2: "0f", transfer: false, entry: 0, count: entrycount, reftime: historyreftime, send: 0};
                 service.addCharacteristic(Characteristic.TemperatureDisplayUnits); // Needed to show history for temperatue
+                break;
+            }
+
+            case Service.MotionSensor.UUID : {
+                // treat these as EveHome Motion
+                this.EveHome = {service: historyService, type: service.UUID, sub: service.subtype, evetype: "motion", signature1:"02 1301 1c01", signature2: "02", transfer: false, entry: 0, count: entrycount, reftime: historyreftime, send: 0};
+                //service.addCharacteristic(Characteristic.EveSensitivity);
+                //service.addCharacteristic(Characteristic.EveDuration);
+                service.addCharacteristic(Characteristic.EveLastActivation);
+
+                // Setup initial values and callbacks for charateristics we are using
+                service.getCharacteristic(Characteristic.EveLastActivation).updateValue(this.__EveLastEventTime());
+                service.getCharacteristic(Characteristic.EveLastActivation).on("get", (callback) => {
+                    callback(null, this.__EveLastEventTime());     // time of last event
+                });  
                 break;
             }
 
             case Service.Valve.UUID : {
                 // treat these as EveHome Aqua
                 // for a specific valve
-                this.EveHome = {service: tempService, type: service.UUID, sub: service.subtype, evetype: "aqua", signature1: "03 1f01 2a08 2302", signature2: "05", signature3: "07", transfer: false, entry: 0, count: entrycount, reftime: historyreftime, send: 0};
-                //service.addCharacteristic(Characteristic.EveAquaStatus);
-                //service.addCharacteristic(Characteristic.EveAquaCommand);
+                this.EveHome = {service: historyService, type: service.UUID, sub: service.subtype, evetype: "aqua", signature1: "03 1f01 2a08 2302", signature2: "05", signature3: "07", transfer: false, entry: 0, count: entrycount, reftime: historyreftime, send: 0};
                 break;
             }
 
             case Service.IrrigationSystem.UUID : {
                 // treat an irrigation system as EveHome Aqua
                 // Under this, any valve history will be presented under this. We dont log our History under irrigation service ID at all
-                this.EveHome = {service: tempService, type: Service.Valve.UUID, sub: null, evetype: "aqua", signature1: "03 1f01 2a08 2302", signature2: "05", signature3: "07", transfer: false, entry: 0, count: entrycount, reftime: historyreftime, send: 0};  
-                //service.addCharacteristic(Characteristic.EveAquaStatus);
-                //service.addCharacteristic(Characteristic.EveAquaCommand);
+                this.EveHome = {service: historyService, type: Service.Valve.UUID, sub: null, evetype: "aqua", signature1: "03 1f01 2a08 2302", signature2: "05", signature3: "07", transfer: false, entry: 0, count: entrycount, reftime: historyreftime, send: 0};  
                 break;
             }
 
             case Service.Outlet.UUID : {
                 // treat these as EveHome energy
-                this.EveHome = {service: tempService, type: service.UUID, sub: service.subtype, evetype: "energy", signature1: "04 0102 0202 0702 0f03", signature2: "1f", transfer: false, entry: 0, count: entrycount, reftime: historyreftime, send: 0}; 
+                this.EveHome = {service: historyService, type: service.UUID, sub: service.subtype, evetype: "energy", signature1: "04 0102 0202 0702 0f03", signature2: "1f", transfer: false, entry: 0, count: entrycount, reftime: historyreftime, send: 0}; 
                 service.addCharacteristic(Characteristic.EveVoltage);
                 service.addCharacteristic(Characteristic.EveElectricCurrent);
                 service.addCharacteristic(Characteristic.EveCurrentConsumption);
@@ -512,6 +493,7 @@ HomeKitHistory.prototype.linkToEveHome = function(HomeKitAccessory, service) {
 
                 // Setup some callbacks for Characteristics we want to report back on
                 service.getCharacteristic(Characteristic.EveCurrentConsumption).on("get", (callback) => {
+                    // Use last history entry for currrent power consumption
                     var historyEntry = this.lastHistory(this.EveHome.type, this.EveHome.sub);
                     var lastWatts = null;
                     if (historyEntry && Object.keys(historyEntry).length != 0) {
@@ -558,6 +540,7 @@ HomeKitHistory.prototype.__EveHistoryStatus = function(callback) {
         numToHex(swap32(1), 8)));  // first entry
 
     callback(null, value);
+    //console.log("DEBUG: __EveHistoryStatus: history for '%s:%s' (%s)", this.EveHome.type, this.EveHome.sub, this.EveHome.evetype)
 }
 
 HomeKitHistory.prototype.__EveHistoryEntries = function(callback) {
@@ -621,13 +604,25 @@ HomeKitHistory.prototype.__EveHistoryEntries = function(callback) {
                         break;
                     }
 
+                    case "motion" : {
+                        // contact and motion sensors treated the same for status
+                        dataStream += util.format(
+                            " 0d %s %s %s %s 0000",
+                            numToHex(swap32(this.EveHome.entry), 8),
+                            numToHex(swap32(historyEntry.time - this.EveHome.reftime - EPOCH_OFFSET), 8),
+                            this.EveHome.signature2,
+                            numToHex(historyEntry.status, 2));
+                        break;
+                    }
+
                     case "contact" : {
+                        // contact and motion sensors treated the same for status
                         dataStream += util.format(
                             " 0b %s %s %s %s",
                             numToHex(swap32(this.EveHome.entry), 8),
                             numToHex(swap32(historyEntry.time - this.EveHome.reftime - EPOCH_OFFSET), 8),
                             this.EveHome.signature2,
-                            numToHex(historyEntry.status, 2));    // 0 = Contact detected, 1 = no contact detected
+                            numToHex(historyEntry.status, 2));
                         break;
                     }
 
@@ -689,7 +684,7 @@ HomeKitHistory.prototype.__EveHistoryEntries = function(callback) {
         this.EveHome.transfer = false;
         this.EveHome.send = 0;
         callback(null, hexToBase64('00'));
-        console.log("DEBUG: __EveHistoryEntries: do we every get here.....???");
+        console.log("DEBUG: __EveHistoryEntries: do we every get here.....???", this.EveHome.send, this.EveHome.evetype, this.EveHome.type, this.EveHome.sub, this.EveHome.entry);
     }
 }
 
@@ -922,6 +917,37 @@ Characteristic.EveAquaCommand = function () {
 }
 util.inherits(Characteristic.EveAquaCommand, Characteristic);
 Characteristic.EveAquaCommand.UUID = "E863F11D-079E-48FF-8F27-9C2605A29F52";
+
+Characteristic.EveSensitivity = function () {
+	Characteristic.call(this, "Eve Motion Sensitivity", "E863F120-079E-48FF-8F27-9C2605A29F52");
+	this.setProps({
+        format: Characteristic.Formats.UINT8,
+        perms: [Characteristic.Perms.READ, Characteristic.Perms.WRITE, Characteristic.Perms.NOTIFY],
+        minValue: 0,
+        maxValue: 7,
+        validValues: [0, 4, 7]
+	});
+	this.value = this.getDefaultValue();
+}
+util.inherits(Characteristic.EveSensitivity, Characteristic);
+Characteristic.EveSensitivity.UUID = "E863F120-079E-48FF-8F27-9C2605A29F52";
+Characteristic.EveSensitivity.HIGH = 0
+Characteristic.EveSensitivity.MEDIUM = 4
+Characteristic.EveSensitivity.LOW = 7
+
+Characteristic.EveDuration = function () {
+	Characteristic.call(this, "Eve Motion Duration", "E863F12D-079E-48FF-8F27-9C2605A29F52");
+	this.setProps({
+        format: Characteristic.Formats.UINT16,
+        perms: [Characteristic.Perms.READ, Characteristic.Perms.WRITE, Characteristic.Perms.NOTIFY],
+        minValue: 5,
+        maxValue: 54000,
+        validValues: [5, 10, 20, 30, 60, 120, 300, 600, 1200, 1800, 3600, 7200, 10800, 18000, 36000, 43200, 54000]
+	});
+	this.value = this.getDefaultValue();
+}
+util.inherits(Characteristic.EveDuration, Characteristic);
+Characteristic.EveDuration.UUID = "E863F12D-079E-48FF-8F27-9C2605A29F52";
 
 // EveHomeHistory Service
 Service.EveHomeHistory = function(displayName, subtype) {
