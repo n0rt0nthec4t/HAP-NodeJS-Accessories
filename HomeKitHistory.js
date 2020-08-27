@@ -2,16 +2,21 @@
 // Simple history service for HomeKit developed accessories with HAP-NodeJS
 //
 // todo
-// -- import history for sprinkler/irrigation systems to EveHome (Aqua)
 // -- get humidity recordings for EveHome thermo
-// -- get history to show for EveHoem motion 
-// -- notify Eve when new history entries added
+// -- get history to show for EveHome motion when attached to a smoke sensor
+// -- doorbell button press hsitory to show
 //
 // done
 // -- initial support for importing our history into EveHome
 // -- developed simple history service for HomeKit HAP-NodeJS accessories
+// -- import history for sprinkler/irrigation systems to EveHome (Aqua)
+// -- fixed door history bug with inverted status
+// -- notify Eve when new history entries added
 //
-// Version 20/5/2020
+// bugs
+// -- when motion sensor paired with smoke service, EveHome thinks its an Eve Smoke, but no motion history shows
+//
+// Version 25/8/2020
 // Mark Hulskamp
 
 const MAX_HISTORY_SIZE = 16384; // 16k entries
@@ -27,7 +32,6 @@ var storage = require("node-persist");
 class HomeKitHistory {
 	constructor(HomeKitAccessory, optionalParams) {
 
-        this.fillTimer = null;
         if (typeof (optionalParams) === "object") {
             this.maxEntries = optionalParams.maxEntries || MAX_HISTORY_SIZE; // used for rolling history. if 0, means no rollover
             this.location = optionalParams.location || "";
@@ -179,6 +183,16 @@ HomeKitHistory.prototype.addHistory = function(service, entry) {
             this.__addEntry(service.UUID, service.subtype, entry.time, historyEntry);
             break;
         }
+
+        case Service.Doorbell.UUID : {
+            // Motion sensor history
+            // entry.time => unix time in seconds
+            // entry.status => 1 = doorbell pressed, 0 = not pressed
+            historyEntry.status = entry.status;
+            if (typeof entry.restart != "undefined") historyEntry.restart = entry.restart;
+            this.__addEntry(service.UUID, service.subtype, entry.time, historyEntry);
+            break;
+        }
     }
 }
 
@@ -325,6 +339,8 @@ HomeKitHistory.prototype.lastHistory = function(service, subtype) {
     if (typeof service.subtype == "undefined" && typeof subtype == "undefined") {
         findSub = 0;
     }
+
+    // If subtype is "null" find newest event based on time
     var typeIndex = this.historyData.types.findIndex(type => ((type.type == findUUID && type.sub == findSub && subtype != null) || (type.type == findUUID && subtype == null)));
     return (typeIndex != -1 ? this.historyData.data[this.historyData.types[typeIndex].lastEntry] : null);
 }
@@ -352,56 +368,54 @@ HomeKitHistory.prototype.__updateHistoryTypes = function() {
 // Overlay EveHome service, characteristics and functions
 // Alot of code taken from fakegato https://github.com/simont77/fakegato-history
 // references from https://github.com/ebaauw/homebridge-lib/blob/master/lib/EveHomeKitTypes.js
-var hexToBase64 = function (val) {
-	return new Buffer(('' + val).replace(/[^0-9A-F]/ig, ''), 'hex').toString('base64');
+//
+var encodeEveData = function (string) {
+	return Buffer.from(('' + string).replace(/[^a-fA-F0-9]/ig, ''), 'hex').toString('base64');
 }
 
-var base64ToHex = function (val) {
-	if (!val)
-		return val;
-	return new Buffer(val, 'base64').toString('hex');
+var decodeEveData = function (data) {
+    if (typeof data != "string") return data;
+	return Buffer.from(data, 'base64').toString('hex');
 }
 
-var	swap16 = function (val) {
-	return ((val & 0xFF) << 8)
-		| ((val >>> 8) & 0xFF);
+// Converts a number into a string for EveHome, including formatting to byte width and reverse byte order
+// handles upto 64bit values
+var numberToEveHexString = function (number, bytes) {
+    if (typeof number != "number") return number;
+    var tempString = '0000000000000000' + number.toString(16);
+    tempString = tempString.slice(-1 * bytes).match(/[a-fA-F0-9]{2}/g).reverse().join('');
+    return tempString;
 }
 
-var swap32 = function (val) {
-	return ((val & 0xFF) << 24)
-		| ((val & 0xFF00) << 8)
-		| ((val >>> 8) & 0xFF00)
-		| ((val >>> 24) & 0xFF);
+// Converts Eve encoded hex string to number
+var EveHexStringToNumber = function (string) {
+    if (typeof string != "string") return string;
+    var tempString = string.match(/[a-fA-F0-9]{2}/g).reverse().join('');
+    return Number(`0x${tempString}`);   // convert to number on return
 }
 
-var numToHex = function (val, len) {
-	var s = Number(val >>> 0).toString(16);
-	if (s.length % 2 != 0) {
-		s = '0' + s;
-	}
-	if (len) {
-		return ('0000000000000' + s).slice(-1 * len);
-	}
-	return s;
-}
+// Overlay our history into EveHome. Can only have one service history exposed to EveHome (ATM... see if can work around)
+// Returns object created for our EveHome accessory if successfull
+HomeKitHistory.prototype.linkToEveHome = function(HomeKitAccessory, service, optionalParams) {
+    var allowReset = false;
+    var processCommand = null;
+    if (typeof (optionalParams) === "object") {
+        allowReset = optionalParams.allowReset || false;    // Allow EveHome to reset our history (clear it)
+        processCommand = optionalParams.ProcessCommand || null; // function to process set data for commands outside of this library
+    }
 
-HomeKitHistory.prototype.linkToEveHome = function(HomeKitAccessory, service) {
-    // Overlay our history into EveHome. Can only have one service history exposed to EveHome (ATM... see if can work around)
     if (typeof this.EveHome == "undefined" || (this.EveHome && this.EveHome.hasOwnProperty("service") == false)) {
-        this.EveHome = {};  // initialise our object for tracking data to EveHome
-        var historyService = HomeKitAccessory.addService(Service.EveHomeHistory, "", 1);
-
-        var tempHistory = this.getHistory(service.UUID, service.subtype);
-        var historyreftime = (tempHistory.length == 0 ? (this.historyData.reset - EPOCH_OFFSET) : (tempHistory[0].time - EPOCH_OFFSET));
-        var entrycount = tempHistory.length;
-    
         switch (service.UUID) {
             case Service.Door.UUID :
             case Service.Window.UUID :
             case Service.WindowCovering.UUID : 
             case Service.GarageDoorOpener.UUID : {
                 // treat these as EveHome Door but with inverse status for open/closed
-                this.EveHome = {service: historyService, type: service.UUID, sub: service.subtype, evetype: "door", signature1: "01 0601", signature2: "01", transfer: false, entry: 0, count: entrycount, reftime: historyreftime, send: 0};
+                var historyService = HomeKitAccessory.addService(Service.EveHomeHistory, "", 1);
+                var tempHistory = this.getHistory(service.UUID, service.subtype);
+                var historyreftime = (tempHistory.length == 0 ? (this.historyData.reset - EPOCH_OFFSET) : (tempHistory[0].time - EPOCH_OFFSET));
+
+                this.EveHome = {service: historyService, type: service.UUID, sub: service.subtype, evetype: "door", signature1: "01 0601", signature2: "01", entry: 0, count: tempHistory.length, reftime: historyreftime, send: 0};
                 service.addCharacteristic(Characteristic.EveLastActivation);
                 service.addCharacteristic(Characteristic.EveOpenDuration);
                 service.addCharacteristic(Characteristic.EveClosedDuration);
@@ -409,19 +423,23 @@ HomeKitHistory.prototype.linkToEveHome = function(HomeKitAccessory, service) {
 
                 // Setup initial values and callbacks for charateristics we are using
                 service.getCharacteristic(Characteristic.EveTimesOpened).updateValue(this.entryCount(this.EveHome.type, this.EveHome.sub, {status: 1}));   // Count of entries based upon status = 1, opened
-                service.getCharacteristic(Characteristic.EveLastActivation).updateValue(this.__EveLastEventTime());
+                service.getCharacteristic(Characteristic.EveLastActivation).updateValue(this.__EveLastEventTime()); // time of last event in seconds since first event
                 service.getCharacteristic(Characteristic.EveTimesOpened).on("get", (callback) => {
                     callback(null, this.entryCount(this.EveHome.type, this.EveHome.sub, {status: 1}));  // Count of entries based upon status = 1, opened
                 });
                 service.getCharacteristic(Characteristic.EveLastActivation).on("get", (callback) => {
-                    callback(null, this.__EveLastEventTime());  // time of last event
+                    callback(null, this.__EveLastEventTime());  // time of last event in seconds since first event
                 }); 
                 break;
             }
 
             case Service.ContactSensor.UUID : {
-                // treat these as EveHome Door 
-                this.EveHome = {service: historyService, type: service.UUID, sub: service.subtype, evetype: "contact", signature1: "01 0601", signature2: "01", transfer: false, entry: 0, count: entrycount, reftime: historyreftime, send: 0};
+                // treat these as EveHome Door
+                var historyService = HomeKitAccessory.addService(Service.EveHomeHistory, "", 1);
+                var tempHistory = this.getHistory(service.UUID, service.subtype);
+                var historyreftime = (tempHistory.length == 0 ? (this.historyData.reset - EPOCH_OFFSET) : (tempHistory[0].time - EPOCH_OFFSET));
+
+                this.EveHome = {service: historyService, type: service.UUID, sub: service.subtype, evetype: "contact", signature1: "01 0601", signature2: "01", entry: 0, count: tempHistory.length, reftime: historyreftime, send: 0};
                 service.addCharacteristic(Characteristic.EveLastActivation);
                 service.addCharacteristic(Characteristic.EveOpenDuration);
                 service.addCharacteristic(Characteristic.EveClosedDuration);
@@ -429,12 +447,12 @@ HomeKitHistory.prototype.linkToEveHome = function(HomeKitAccessory, service) {
 
                 // Setup initial values and callbacks for charateristics we are using
                 service.getCharacteristic(Characteristic.EveTimesOpened).updateValue(this.entryCount(this.EveHome.type, this.EveHome.sub, {status: 1}));   // Count of entries based upon status = 1, opened
-                service.getCharacteristic(Characteristic.EveLastActivation).updateValue(this.__EveLastEventTime());
+                service.getCharacteristic(Characteristic.EveLastActivation).updateValue(this.__EveLastEventTime()); // time of last event in seconds since first event
                 service.getCharacteristic(Characteristic.EveTimesOpened).on("get", (callback) => {
                     callback(null, this.entryCount(this.EveHome.type, this.EveHome.sub, {status: 1})); // Count of entries based upon status = 1, opened
                 });
                 service.getCharacteristic(Characteristic.EveLastActivation).on("get", (callback) => {
-                    callback(null, this.__EveLastEventTime());   // time of last event
+                    callback(null, this.__EveLastEventTime());  // time of last event in seconds since first event
                 });  
                 break;
             }
@@ -442,29 +460,43 @@ HomeKitHistory.prototype.linkToEveHome = function(HomeKitAccessory, service) {
             case Service.HeaterCooler.UUID :
             case Service.Thermostat.UUID : {
                 // treat these as EveHome Thermo
-                this.EveHome = {service: historyService, type: service.UUID, sub: service.subtype, evetype: "thermo", signature1: "05 0102 1102 1001 1201 1d01", signature2: "1f", transfer: false, entry: 0, count: entrycount, reftime: historyreftime, send: 0}; 
+                var historyService = HomeKitAccessory.addService(Service.EveHomeHistory, "", 1);
+                var tempHistory = this.getHistory(service.UUID, service.subtype);
+                var historyreftime = (tempHistory.length == 0 ? (this.historyData.reset - EPOCH_OFFSET) : (tempHistory[0].time - EPOCH_OFFSET));
+
+                this.EveHome = {service: historyService, type: service.UUID, sub: service.subtype, evetype: "thermo", signature1: "05 0102 1102 1001 1201 1d01", signature2: "1f", entry: 0, count: tempHistory.length, reftime: historyreftime, send: 0}; 
                 service.addCharacteristic(Characteristic.EveValvePosition);   // Needed to show history for thermostating heating modes (valve position)
                 break;
             }
 
             case Service.TemperatureSensor.UUID : {
                 // treat these as EveHome Room
-                this.EveHome = {service: historyService, type: service.UUID, sub: service.subtype, evetype: "room", signature1: "04 0102 0202 0402 0f03", signature2: "0f", transfer: false, entry: 0, count: entrycount, reftime: historyreftime, send: 0};
-                service.addCharacteristic(Characteristic.TemperatureDisplayUnits); // Needed to show history for temperatue
+                var historyService = HomeKitAccessory.addService(Service.EveHomeHistory, "", 1);
+                var tempHistory = this.getHistory(service.UUID, service.subtype);
+                var historyreftime = (tempHistory.length == 0 ? (this.historyData.reset - EPOCH_OFFSET) : (tempHistory[0].time - EPOCH_OFFSET));
+
+                this.EveHome = {service: historyService, type: service.UUID, sub: service.subtype, evetype: "room", signature1: "04 0102 0202 0402 0f03", signature2: "0f", entry: 0, count: tempHistory.length, reftime: historyreftime, send: 0};
+                service.addCharacteristic(Characteristic.TemperatureDisplayUnits); // Needed to show history for temperature
                 break;
             }
 
             case Service.MotionSensor.UUID : {
                 // treat these as EveHome Motion
-                this.EveHome = {service: historyService, type: service.UUID, sub: service.subtype, evetype: "motion", signature1:"02 1301 1c01", signature2: "02", transfer: false, entry: 0, count: entrycount, reftime: historyreftime, send: 0};
-                //service.addCharacteristic(Characteristic.EveSensitivity);
-                //service.addCharacteristic(Characteristic.EveDuration);
+                var historyService = HomeKitAccessory.addService(Service.EveHomeHistory, "", 1);
+                var tempHistory = this.getHistory(service.UUID, service.subtype);
+                var historyreftime = (tempHistory.length == 0 ? (this.historyData.reset - EPOCH_OFFSET) : (tempHistory[0].time - EPOCH_OFFSET));
+
+                this.EveHome = {service: historyService, type: service.UUID, sub: service.subtype, evetype: "motion", signature1:"02 1301 1c01", signature2: "02", entry: 0, count: tempHistory.length, reftime: historyreftime, send: 0};
+                service.addCharacteristic(Characteristic.EveSensitivity);
+                service.addCharacteristic(Characteristic.EveDuration);
                 service.addCharacteristic(Characteristic.EveLastActivation);
 
+                // TODO - What to add if on an accessory with a Smoke service to show motion history?
+
                 // Setup initial values and callbacks for charateristics we are using
-                service.getCharacteristic(Characteristic.EveLastActivation).updateValue(this.__EveLastEventTime());
+                service.getCharacteristic(Characteristic.EveLastActivation).updateValue(this.__EveLastEventTime()); // time of last event in seconds since first event
                 service.getCharacteristic(Characteristic.EveLastActivation).on("get", (callback) => {
-                    callback(null, this.__EveLastEventTime());     // time of last event
+                    callback(null, this.__EveLastEventTime());  // time of last event in seconds since first event
                 });  
                 break;
             }
@@ -472,30 +504,102 @@ HomeKitHistory.prototype.linkToEveHome = function(HomeKitAccessory, service) {
             case Service.Valve.UUID : {
                 // treat these as EveHome Aqua
                 // for a specific valve
-                this.EveHome = {service: historyService, type: service.UUID, sub: service.subtype, evetype: "aqua", signature1: "03 1f01 2a08 2302", signature2: "05", signature3: "07", transfer: false, entry: 0, count: entrycount, reftime: historyreftime, send: 0};
+                var historyService = HomeKitAccessory.addService(Service.EveHomeHistory, "", 1);
+                var tempHistory = this.getHistory(service.UUID, service.subtype);
+                var historyreftime = (tempHistory.length == 0 ? (this.historyData.reset - EPOCH_OFFSET) : (tempHistory[0].time - EPOCH_OFFSET));
+
+                this.EveHome = {service: historyService, type: service.UUID, sub: service.subtype, evetype: "aqua", signature1: "03 1f01 2a08 2302", signature2: "05", signature3: "07", entry: 0, count: tempHistory.length, reftime: historyreftime, send: 0};
+                service.addCharacteristic(Characteristic.EveGetConfiguration);
+                service.addCharacteristic(Characteristic.EveSetConfiguration);
+
+                // Setup initial values and callbacks for charateristics we are using
+                service.getCharacteristic(Characteristic.EveGetConfiguration).updateValue(this.__EveAquaWaterDetails());
+                service.getCharacteristic(Characteristic.EveGetConfiguration).on("get", (callback) => {
+                    callback(null, this.__EveAquaWaterDetails());
+                }); 
                 break;
             }
 
             case Service.IrrigationSystem.UUID : {
                 // treat an irrigation system as EveHome Aqua
                 // Under this, any valve history will be presented under this. We dont log our History under irrigation service ID at all
-                this.EveHome = {service: historyService, type: Service.Valve.UUID, sub: null, evetype: "aqua", signature1: "03 1f01 2a08 2302", signature2: "05", signature3: "07", transfer: false, entry: 0, count: entrycount, reftime: historyreftime, send: 0};  
+
+                // TODO - see if we can add history per valve service under the irrigation system????. History service per valve???
+                var historyService = HomeKitAccessory.addService(Service.EveHomeHistory, "", 1);  
+                var tempHistory = this.getHistory(Service.Valve.UUID, null);
+                var historyreftime = (tempHistory.length == 0 ? (this.historyData.reset - EPOCH_OFFSET) : (tempHistory[0].time - EPOCH_OFFSET));
+  
+                this.EveHome = {service: historyService, type: Service.Valve.UUID, sub: null, evetype: "aqua", signature1: "03 1f01 2a08 2302", signature2: "05", signature3: "07", entry: 0, count: tempHistory.length, reftime: historyreftime, send: 0};
+                service.addCharacteristic(Characteristic.EveGetConfiguration);
+                service.addCharacteristic(Characteristic.EveSetConfiguration);
+
+                // Setup initial values and callbacks for charateristics we are using
+                service.getCharacteristic(Characteristic.EveGetConfiguration).updateValue(this.__EveAquaWaterDetails());
+                service.getCharacteristic(Characteristic.EveGetConfiguration).on("get", (callback) => {
+                    callback(null, this.__EveAquaWaterDetails());
+                });
+                service.getCharacteristic(Characteristic.EveSetConfiguration).on("set", (value, callback) => {
+                    // Loop through set commands passed to us
+                    var valHex = decodeEveData(value);
+                    var index = 0;
+                    while (index < valHex.length) {
+                        // first byte is command
+                        // second byte is size of data for command
+                        command = valHex.substr(index, 2);
+                        size = parseInt(valHex.substr(index + 2, 2), 16) * 2;
+                        data = valHex.substr(index + 4, parseInt(valHex.substr(index + 2, 2), 16) * 2);
+
+                        switch(command) {
+                            case "2e" : {
+                                // flow rate in ml/Minute
+                                var flowrateLS = EveHexStringToNumber(data) * 60; // flow rate in ml/Minute
+                                break;
+                            }
+
+                            case "2f" : {
+                                // reset timestamp in seconds since EPOCH
+                                var timestamp = (EPOCH_OFFSET + EveHexStringToNumber(data));
+                                break;
+                            }
+
+                            default : {
+                                if (typeof optionalParams.ProcessCommand == "function") optionalParams.ProcessCommand(command, data); // Send command to be processed if we havent handled it here
+                                break;
+                            }
+                        }
+                        index += 4 + size;  // Move to next command accounting for header size of 4 bytes
+                    };
+                    callback();
+                });
                 break;
             }
 
             case Service.Outlet.UUID : {
                 // treat these as EveHome energy
-                this.EveHome = {service: historyService, type: service.UUID, sub: service.subtype, evetype: "energy", signature1: "04 0102 0202 0702 0f03", signature2: "1f", transfer: false, entry: 0, count: entrycount, reftime: historyreftime, send: 0}; 
+                var historyService = HomeKitAccessory.addService(Service.EveHomeHistory, "", 1);  
+                var tempHistory = this.getHistory(Service.Valve.UUID, null);
+                var historyreftime = (tempHistory.length == 0 ? (this.historyData.reset - EPOCH_OFFSET) : (tempHistory[0].time - EPOCH_OFFSET));
+
+                this.EveHome = {service: historyService, type: service.UUID, sub: service.subtype, evetype: "energy", signature1: "04 0102 0202 0702 0f03", signature2: "1f", entry: 0, count: tempHistory.length, reftime: historyreftime, send: 0}; 
                 service.addCharacteristic(Characteristic.EveVoltage);
                 service.addCharacteristic(Characteristic.EveElectricCurrent);
                 service.addCharacteristic(Characteristic.EveCurrentConsumption);
                 service.addCharacteristic(Characteristic.EveTotalConsumption);
 
-                // Setup some callbacks for Characteristics we want to report back on
+                // Setup initial values and callbacks for charateristics we are using
+                service.getCharacteristic(Characteristic.EveCurrentConsumption).updateValue(() => {
+                    // Use last history entry for currrent power consumption
+                    var historyEntry = this.lastHistory(this.EveHome.type, this.EveHome.sub);
+                    var lastWatts = 0;
+                    if (historyEntry && Object.keys(historyEntry).length != 0) {
+                        lastWatts = historyEntry.watts;
+                    }
+                    return lastWatts;
+                });
                 service.getCharacteristic(Characteristic.EveCurrentConsumption).on("get", (callback) => {
                     // Use last history entry for currrent power consumption
                     var historyEntry = this.lastHistory(this.EveHome.type, this.EveHome.sub);
-                    var lastWatts = null;
+                    var lastWatts = 0;
                     if (historyEntry && Object.keys(historyEntry).length != 0) {
                         lastWatts = historyEntry.watts;
                     }
@@ -503,14 +607,32 @@ HomeKitHistory.prototype.linkToEveHome = function(HomeKitAccessory, service) {
                 });
                 break;
             }
+            
+            case Service.Doorbell.UUID : {
+                // treat these as EveHome button??
+                var historyService = HomeKitAccessory.addService(Service.EveHomeHistory, "", 1);
+                var tempHistory = this.getHistory(service.UUID, service.subtype);
+                var historyreftime = (tempHistory.length == 0 ? (this.historyData.reset - EPOCH_OFFSET) : (tempHistory[0].time - EPOCH_OFFSET));
+
+                this.EveHome = {service: historyService, type: service.UUID, sub: service.subtype, evetype: "switch", signature1: "01 0e01", signature2: "01", entry: 0, count: tempHistory.length, reftime: historyreftime, send: 0};
+                service.addCharacteristic(Characteristic.EveLastActivation);
+
+                // Setup initial values and callbacks for charateristics we are using
+                service.getCharacteristic(Characteristic.EveLastActivation).updateValue(this.__EveLastEventTime()); // time of last event in seconds since first event
+                break;
+            }
         }
     
-        // Setup callbacks
-        this.EveHome.service.getCharacteristic(Characteristic.EveResetTotal).on("get", (callback) => {callback(null, this.historyData.reset - EPOCH_OFFSET)});   // time since history reset
-        this.EveHome.service.getCharacteristic(Characteristic.EveHistoryStatus).on("get", this.__EveHistoryStatus.bind(this));
-        this.EveHome.service.getCharacteristic(Characteristic.EveHistoryEntries).on("get", this.__EveHistoryEntries.bind(this));
-        this.EveHome.service.getCharacteristic(Characteristic.EveHistoryRequest).on("set", this.__EveHistoryRequest.bind(this));
-        this.EveHome.service.getCharacteristic(Characteristic.EveSetTime).on("set", this.__EveSetTime.bind(this));
+        // Setup callbacks if our service successfully created
+        if (typeof this.EveHome.service != "undefined" && this.EveHome.service != null) {
+            this.EveHome.service.getCharacteristic(Characteristic.EveResetTotal).on("get", (callback) => {callback(null, this.historyData.reset - EPOCH_OFFSET)});   // time since history reset
+            this.EveHome.service.getCharacteristic(Characteristic.EveHistoryStatus).on("get", this.__EveHistoryStatus.bind(this));
+            this.EveHome.service.getCharacteristic(Characteristic.EveHistoryEntries).on("get", this.__EveHistoryEntries.bind(this));
+            this.EveHome.service.getCharacteristic(Characteristic.EveHistoryRequest).on("set", this.__EveHistoryRequest.bind(this));
+            this.EveHome.service.getCharacteristic(Characteristic.EveSetTime).on("set", this.__EveSetTime.bind(this));
+
+            return this.EveHome.service;    // Return service handle for our EveHome accessory service
+        }
     }
 }
 
@@ -524,35 +646,62 @@ HomeKitHistory.prototype.__EveLastEventTime = function() {
     return lastTime;
 }
 
+HomeKitHistory.prototype.__EveAquaWaterDetails = function() {
+    // returns an encoded value formatted for an Eve Aqua device for water usage and last water time
+    // todo encode schedules if set and water flow rate
+    var tempHistory = this.getHistory(this.EveHome.type, this.EveHome.sub); // get flattened history array for easier processing
+
+    // Calculate total water usage over history period
+    var totalWater = 0;
+    tempHistory.forEach(historyEntry => {
+        if (historyEntry.status == 0) {
+            // add to total water usage if we have a valve closed event
+            totalWater += parseFloat(historyEntry.water);
+        }
+    });
+
+    var value = util.format(
+        "00022300 0302 %s 040c4156323248314130303036330602080007042a3000000b0200000501000204f82c00001401030f0400000000450505000000004609050000000e000042064411051c0005033c0000003a814b42a34d8c4047110594186d19071ad91ab40000003c00000048060500000000004a06050000000000d004 %s 9b04 %s 2f0e %s 0000 2e02 %s 00000000000000001e02300c",
+        //"00022300 0302 %s 45050500000000 4609050000000e0000 4806050000000000 4a06050000000000 d004 %s 9b04 %s 2f0e %s 0000 2e02 %s 00000000000000001e02300c",
+        //"0302 %s 45050500000000 4609050000000e0000 4806050000000000 4a06050000000000 d004 %s 9b04 %s 2f0e %s 0000 2e02 %s",
+
+        numberToEveHexString(1208, 4),  // firmware version (build 1208)
+        numberToEveHexString(tempHistory.length != 0 ? tempHistory[tempHistory.length - 1].time : 0, 8),  // time of last event, 0 if never watered
+        numberToEveHexString(Math.floor(new Date() / 1000), 8), // "now" time
+        numberToEveHexString(Math.floor(totalWater * 1000), 16), // total water usage in ml (64bit value)
+        numberToEveHexString(Math.floor(0 / 60), 4)); // water flow rate in ml/L
+    return encodeEveData(value);
+};
+
 HomeKitHistory.prototype.__EveHistoryStatus = function(callback) {
     var tempHistory = this.getHistory(this.EveHome.type, this.EveHome.sub); // get flattened history array for easier processing
     var historyTime = (tempHistory.length == 0 ? Math.floor(new Date() / 1000) : tempHistory[tempHistory.length - 1].time);
     this.EveHome.reftime = (tempHistory.length == 0 ? (this.historyData.reset - EPOCH_OFFSET) : (tempHistory[0].time - EPOCH_OFFSET));
-    this.EveHome.count = tempHistory.length;
+    this.EveHome.count = tempHistory.length;    // Number of history entries for this type
 
-    var value = hexToBase64(util.format(
-        '%s 00000000 %s %s %s %s %s 000000000101',
-        numToHex(swap32(historyTime - this.EveHome.reftime - EPOCH_OFFSET), 8),
-        numToHex(swap32(this.EveHome.reftime), 8), // reference time (time of first history??)
+    var value = util.format(
+        "%s 00000000 %s %s %s %s %s 000000000101",
+        numberToEveHexString(historyTime - this.EveHome.reftime - EPOCH_OFFSET, 8),
+        numberToEveHexString(this.EveHome.reftime, 8), // reference time (time of first history??)
         this.EveHome.signature1,
-        numToHex(swap16(this.EveHome.count), 4), // count of entries
-        numToHex(swap16((this.maxEntries == 0 ? MAX_HISTORY_SIZE : this.maxEntries)), 4),  // history max size
-        numToHex(swap32(1), 8)));  // first entry
+        numberToEveHexString(this.EveHome.count, 4), // count of entries
+        numberToEveHexString(this.maxEntries == 0 ? MAX_HISTORY_SIZE : this.maxEntries, 4),  // history max size
+        numberToEveHexString(1, 8));  // first entry
 
-    callback(null, value);
-    //console.log("DEBUG: __EveHistoryStatus: history for '%s:%s' (%s)", this.EveHome.type, this.EveHome.sub, this.EveHome.evetype)
+    callback(null, encodeEveData(value));
+    //console.log("DEBUG: __EveHistoryStatus: history for '%s:%s' (%s) - Entries %s", this.EveHome.type, this.EveHome.sub, this.EveHome.evetype, this.EveHome.count);
 }
 
 HomeKitHistory.prototype.__EveHistoryEntries = function(callback) {
     // Streams our history data back to EveHome when requested
-    if (this.EveHome.entry <= this.EveHome.count && this.EveHome.transfer == true) {
-        var dataStream = "";
+    var dataStream = "";
+    if (this.EveHome.entry <= this.EveHome.count && this.EveHome.send != 0) {
         var tempHistory = this.getHistory(this.EveHome.type, this.EveHome.sub); // get flattened history array for easier processing
 
         dataStream += util.format(
             " 15 %s 0100 0000 81 %s 0000 0000 00 0000",
-            numToHex(swap32(this.EveHome.entry), 8),
-            numToHex(swap32(this.EveHome.reftime), 8)); // not sure this is actually needed
+            numberToEveHexString(this.EveHome.entry, 8),
+            numberToEveHexString(this.EveHome.reftime, 8)); // not sure this is actually needed
 
         for (var i = 0; i < EVEHOME_MAX_STREAM; i++) {
             if (tempHistory.length != 0 && (this.EveHome.entry - 1) <= tempHistory.length) {
@@ -563,19 +712,19 @@ HomeKitHistory.prototype.__EveHistoryEntries = function(callback) {
                             // Valve opened
                             dataStream += util.format(
                                 " 0d %s %s %s %s 300c",
-                                numToHex(swap32(this.EveHome.entry), 8),
-                                numToHex(swap32(historyEntry.time - this.EveHome.reftime - EPOCH_OFFSET), 8),
+                                numberToEveHexString(this.EveHome.entry, 8),
+                                numberToEveHexString(historyEntry.time - this.EveHome.reftime - EPOCH_OFFSET, 8),
                                 this.EveHome.signature2,
-                                numToHex(historyEntry.status, 2));
+                                numberToEveHexString(historyEntry.status, 2));
                         } else {
                             // Valve closed
                             dataStream += util.format(
                                 " 15 %s %s %s %s %s 00000000 300c",
-                                numToHex(swap32(this.EveHome.entry), 8),
-                                numToHex(swap32(historyEntry.time - this.EveHome.reftime - EPOCH_OFFSET), 8),
+                                numberToEveHexString(this.EveHome.entry, 8),
+                                numberToEveHexString(historyEntry.time - this.EveHome.reftime - EPOCH_OFFSET, 8),
                                 this.EveHome.signature3,
-                                numToHex(historyEntry.status, 2),
-                                numToHex(swap32(historyEntry.amount * 1000), 8)); // in millilitres
+                                numberToEveHexString(historyEntry.status, 2),
+                                numberToEveHexString(Math.floor(parseFloat(historyEntry.water) * 1000), 8)); // in millilitres
                         }
                         break;
                     }
@@ -583,46 +732,37 @@ HomeKitHistory.prototype.__EveHistoryEntries = function(callback) {
                     case "room": {
                         dataStream += util.format(
                             " 13 %s %s %s %s %s %s 0000 00",
-                            numToHex(swap32(this.EveHome.entry), 8),
-                            numToHex(swap32(historyEntry.time - this.EveHome.reftime - EPOCH_OFFSET), 8),
+                            numberToEveHexString(this.EveHome.entry, 8),
+                            numberToEveHexString(historyEntry.time - this.EveHome.reftime - EPOCH_OFFSET, 8),
                             this.EveHome.signature2,
-                            numToHex(swap16(historyEntry.temperature * 100), 4), // temperature
-                            numToHex(swap16(historyEntry.humidity * 100), 4), // Humidity
-                            numToHex(swap16((historyEntry.hasOwnProperty("ppm") ? historyEntry.ppm * 10 : 10)), 4)); // PPM - air quality
+                            numberToEveHexString(historyEntry.temperature * 100, 4), // temperature
+                            numberToEveHexString(historyEntry.humidity * 100, 4), // Humidity
+                            numberToEveHexString(historyEntry.hasOwnProperty("ppm") ? historyEntry.ppm * 10 : 10, 4)); // PPM - air quality
                         break;
                     }
 
                     case "weather": {
                         dataStream += util.format(
                             " 10 %s %s %s %s %s %s",
-                            numToHex(swap32(this.EveHome.entry), 8),
-                            numToHex(swap32(historyEntry.time - this.EveHome.reftime - EPOCH_OFFSET), 8),
+                            numberToEveHexString(this.EveHome.entry, 8),
+                            numberToEveHexString(historyEntry.time - this.EveHome.reftime - EPOCH_OFFSET, 8),
                             this.EveHome.signature2,
-                            numToHex(swap16(historyEntry.temperature * 100), 4), // temperature
-                            numToHex(swap16(historyEntry.humidity * 100), 4), // Humidity
-                            numToHex(swap16((historyEntry.hasOwnProperty("pressure") ? historyEntry.pressure * 10 : 10)), 4)); // Pressure
+                            numberToEveHexString(historyEntry.temperature * 100, 4), // temperature
+                            numberToEveHexString(historyEntry.humidity * 100, 4), // Humidity
+                            numberToEveHexString(historyEntry.hasOwnProperty("pressure") ? historyEntry.pressure * 10 : 10, 4)); // Pressure
                         break;
                     }
 
-                    case "motion" : {
-                        // contact and motion sensors treated the same for status
-                        dataStream += util.format(
-                            " 0d %s %s %s %s 0000",
-                            numToHex(swap32(this.EveHome.entry), 8),
-                            numToHex(swap32(historyEntry.time - this.EveHome.reftime - EPOCH_OFFSET), 8),
-                            this.EveHome.signature2,
-                            numToHex(historyEntry.status, 2));
-                        break;
-                    }
-
-                    case "contact" : {
-                        // contact and motion sensors treated the same for status
+                    case "motion" : 
+                    case "contact" : 
+                    case "switch " : {
+                        // contact, motion and switch sensors treated the same for status
                         dataStream += util.format(
                             " 0b %s %s %s %s",
-                            numToHex(swap32(this.EveHome.entry), 8),
-                            numToHex(swap32(historyEntry.time - this.EveHome.reftime - EPOCH_OFFSET), 8),
+                            numberToEveHexString(this.EveHome.entry, 8),
+                            numberToEveHexString(historyEntry.time - this.EveHome.reftime - EPOCH_OFFSET, 8),
                             this.EveHome.signature2,
-                            numToHex(historyEntry.status, 2));
+                            numberToEveHexString(historyEntry.status, 2));
                         break;
                     }
 
@@ -631,39 +771,40 @@ HomeKitHistory.prototype.__EveHistoryEntries = function(callback) {
                         // ie: 0 = closed, 1 = opened
                         dataStream += util.format(
                             " 0b %s %s %s %s",
-                            numToHex(swap32(this.EveHome.entry), 8),
-                            numToHex(swap32(historyEntry.time - this.EveHome.reftime - EPOCH_OFFSET), 8),
+                            numberToEveHexString(this.EveHome.entry, 8),
+                            numberToEveHexString(historyEntry.time - this.EveHome.reftime - EPOCH_OFFSET, 8),
                             this.EveHome.signature2,
-                            numToHex(!historyEntry.status, 2));  // status for EveHome (inverted ie: 1 = closed, 0 = opened)
+                            numberToEveHexString(historyEntry.status == 1 ? 0 : 1, 2));  // status for EveHome (inverted ie: 1 = closed, 0 = opened) */
                         break;
                     }
 
                     case "thermo" : {
                         var tempTarget = 0;
-                        if (historyEntry.low == 0 && historyEntry.high != 0) tempTarget = historyEntry.target.high;   // heating limit
-                        if (historyEntry.low != 0 && historyEntry.high != 0) tempTarget = historyEntry.target.high;   // range, so using heating limit
-                        if (historyEntry.low != 0 && historyEntry.high == 0) tempTarget = 0;   // cooling limit
-                        if (historyEntry.low == 0 && historyEntry.high == 0) tempTarget = 0;   // off
+                        if ((historyEntry.low && historyEntry.low == 0) && (historyEntry.high && historyEntry.high != 0)) tempTarget = historyEntry.target.high;   // heating limit
+                        if ((historyEntry.low && historyEntry.low != 0) && (historyEntry.high && historyEntry.high != 0)) tempTarget = historyEntry.target.high;   // range, so using heating limit
+                        if ((historyEntry.low && historyEntry.low != 0) && (historyEntry.high && historyEntry.high == 0)) tempTarget = 0;   // cooling limit
+                        if ((historyEntry.low && historyEntry.low == 0) && (historyEntry.high && historyEntry.high == 0)) tempTarget = 0;   // off
+
 
                         dataStream += util.format(
                             " 11 %s %s %s %s %s %s 0000",
-                            numToHex(swap32(this.EveHome.entry), 8),
-                            numToHex(swap32(historyEntry.time - this.EveHome.reftime - EPOCH_OFFSET), 8),
+                            numberToEveHexString(this.EveHome.entry, 8),
+                            numberToEveHexString(historyEntry.time - this.EveHome.reftime - EPOCH_OFFSET, 8),
                             this.EveHome.signature2,
-                            numToHex(swap16(historyEntry.temperature * 100), 4), // temperature
-                            numToHex(swap16(tempTarget * 100), 4), // target temperature for heating
-                            numToHex((historyEntry.status == 2 ? 100 : 0), 2)); // 0% valve position = off, 100% = heating
-                            //numToHex((historyEntry.status == 2 ? 100 : historyEntry.status == 1 ? 0 : 50), 2)); // 50% valve position = off, 0% = cooling, 100% = heating
+                            numberToEveHexString(historyEntry.temperature * 100, 4), // temperature
+                            numberToEveHexString(tempTarget * 100, 4), // target temperature for heating
+                            numberToEveHexString(historyEntry.status == 2 ? 100 : 0, 2)); // 0% valve position = off, 100% = heating
+                            //numberToEveHexString(historyEntry.status == 2 ? 100 : historyEntry.status == 1 ? 0 : 50, 2)); // 50% valve position = off, 0% = cooling, 100% = heating
                         break;
                     }
 
                     case "energy" : {
                         dataStream += util.format(
                             " 14 %s %s %s 0000 0000 %s 0000 0000",
-                            numToHex(swap32(this.EveHome.entry), 8),
-                            numToHex(swap32(historyEntry.time - this.EveHome.reftime - EPOCH_OFFSET), 8),
+                            numberToEveHexString(this.EveHome.entry, 8),
+                            numberToEveHexString(historyEntry.time - this.EveHome.reftime - EPOCH_OFFSET, 8),
                             this.EveHome.signature2,
-                            numToHex(swap16(historyEntry.watts * 10), 4));  // Power in watts
+                            numberToEveHexString(historyEntry.watts * 10, 4));  // Power in watts
                         break;
                     }
                 }
@@ -673,38 +814,35 @@ HomeKitHistory.prototype.__EveHistoryEntries = function(callback) {
         }
         if (this.EveHome.entry > this.EveHome.count) {
             // No more history data to send back
+            //console.log("DEBUG: __EveHistoryEntries: sent '%s' entries to EveHome ('%s') for '%s:%s'", this.EveHome.send, this.EveHome.evetype, this.EveHome.type, this.EveHome.sub);
+            this.EveHome.send = 0;  // no more to send
             dataStream += " 00";
-            console.log("DEBUG: __EveHistoryEntries: sent '%s' entries to EveHome ('%s') for '%s:%s'", this.EveHome.send, this.EveHome.evetype, this.EveHome.type, this.EveHome.sub);
-            this.EveHome.send = 0;
-            this.EveHome.transfer = false;
         }
-        callback(null, hexToBase64(dataStream));
     } else {
          // We're not transferring any data back
-        this.EveHome.transfer = false;
-        this.EveHome.send = 0;
-        callback(null, hexToBase64('00'));
-        console.log("DEBUG: __EveHistoryEntries: do we every get here.....???", this.EveHome.send, this.EveHome.evetype, this.EveHome.type, this.EveHome.sub, this.EveHome.entry);
+        //console.log("DEBUG: __EveHistoryEntries: do we ever get here.....???", this.EveHome.send, this.EveHome.evetype, this.EveHome.type, this.EveHome.sub, this.EveHome.entry);
+        this.EveHome.send = 0;  // no more to send
+        dataStream = "00";
     }
+    callback(null, encodeEveData(dataStream));
 }
 
 HomeKitHistory.prototype.__EveHistoryRequest = function(value, callback) {
     // Requesting history, starting at specific entry
-    this.EveHome.transfer = true;
-    this.EveHome.entry = parseInt(swap32(parseInt(base64ToHex(value).substring(4, 12), 16)).toString('16'), 16);    // Starting entry
+    this.EveHome.entry = EveHexStringToNumber(decodeEveData(value).substring(4, 12));    // Starting entry
     if (this.EveHome.entry == 0) {
         this.EveHome.entry = 1; // requested to restart from beginning of history for sending to EveHome
     }
     this.EveHome.send = (this.EveHome.count - this.EveHome.entry + 1);    // Number of entries we're expected to send
-    callback(null, value);
+    callback();
     //console.log("DEBUG: __EveHistoryRequest: requested address", this.EveHome.entry);
 }
 
 HomeKitHistory.prototype.__EveSetTime = function(value, callback) {
     // Time stamp from EveHome
-    var tempEntry = new Date((EPOCH_OFFSET + swap32(parseInt(base64ToHex(value), 16))) * 1000);
-    callback(null, value);
-    //console.log("DEBUG: __EveSetTime: timestamp offset", tempEntry);
+    var timestamp = (EPOCH_OFFSET + EveHexStringToNumber(decodeEveData(value)));
+    callback();
+    //console.log("DEBUG: __EveSetTime: timestamp offset", new Date(timeStamp * 1000));
 }
 
 // Eve Reset Total
@@ -768,7 +906,6 @@ Characteristic.EveSetTime = function () {
 util.inherits(Characteristic.EveSetTime, Characteristic);
 Characteristic.EveSetTime.UUID = "E863F121-079E-48FF-8F27-9C2605A29F52";
 
-// Valve Position.. Added to Thermo type accessories
 Characteristic.EveValvePosition = function () {
 	Characteristic.call(this, "Eve Valve Position", "E863F12E-079E-48FF-8F27-9C2605A29F52");
 	this.setProps({
@@ -896,27 +1033,38 @@ Characteristic.EveCurrentConsumption = function () {
 util.inherits(Characteristic.EveCurrentConsumption, Characteristic);
 Characteristic.EveCurrentConsumption.UUID = "E863F10D-079E-48FF-8F27-9C2605A29F52";
 
-Characteristic.EveAquaStatus = function () {
-	Characteristic.call(this, "Eve Aqua Status", "E863F131-079E-48FF-8F27-9C2605A29F52");
+Characteristic.EveGetConfiguration = function () {
+	Characteristic.call(this, "Eve Get Configuration", "E863F131-079E-48FF-8F27-9C2605A29F52");
 	this.setProps({
         format: Characteristic.Formats.DATA,
         perms: [Characteristic.Perms.READ, Characteristic.Perms.NOTIFY]
 	});
 	this.value = this.getDefaultValue();
 }
-util.inherits(Characteristic.EveAquaStatus, Characteristic);
-Characteristic.EveAquaStatus.UUID = "E863F131-079E-48FF-8F27-9C2605A29F52";
+util.inherits(Characteristic.EveGetConfiguration, Characteristic);
+Characteristic.EveGetConfiguration.UUID = "E863F131-079E-48FF-8F27-9C2605A29F52";
 
-Characteristic.EveAquaCommand = function () {
-	Characteristic.call(this, "Eve Aqua Command", "E863F11D-079E-48FF-8F27-9C2605A29F52");
+Characteristic.EveSetConfiguration = function () {
+	Characteristic.call(this, "Eve Set Confoguration", "E863F11D-079E-48FF-8F27-9C2605A29F52");
 	this.setProps({
         format: Characteristic.Formats.DATA,
         perms: [Characteristic.Perms.WRITE, Characteristic.Perms.HIDDEN]
 	});
 	this.value = this.getDefaultValue();
 }
-util.inherits(Characteristic.EveAquaCommand, Characteristic);
-Characteristic.EveAquaCommand.UUID = "E863F11D-079E-48FF-8F27-9C2605A29F52";
+util.inherits(Characteristic.EveSetConfiguration, Characteristic);
+Characteristic.EveSetConfiguration.UUID = "E863F11D-079E-48FF-8F27-9C2605A29F52";
+
+Characteristic.EveFirmwareInfo = function () {
+	Characteristic.call(this, "Eve Motion Sensitivity", "E863F12C-079E-48FF-8F27-9C2605A29F52");
+	this.setProps({
+        format: Characteristic.Formats.DATA,
+        perms: [Characteristic.Perms.READ, Characteristic.Perms.WRITE, Characteristic.Perms.NOTIFY]
+	});
+	this.value = this.getDefaultValue();
+}
+util.inherits(Characteristic.EveFirmwareInfo, Characteristic);
+Characteristic.EveFirmwareInfo.UUID = "E863F12C-079E-48FF-8F27-9C2605A29F52";
 
 Characteristic.EveSensitivity = function () {
 	Characteristic.call(this, "Eve Motion Sensitivity", "E863F120-079E-48FF-8F27-9C2605A29F52");
@@ -931,9 +1079,6 @@ Characteristic.EveSensitivity = function () {
 }
 util.inherits(Characteristic.EveSensitivity, Characteristic);
 Characteristic.EveSensitivity.UUID = "E863F120-079E-48FF-8F27-9C2605A29F52";
-Characteristic.EveSensitivity.HIGH = 0
-Characteristic.EveSensitivity.MEDIUM = 4
-Characteristic.EveSensitivity.LOW = 7
 
 Characteristic.EveDuration = function () {
 	Characteristic.call(this, "Eve Motion Duration", "E863F12D-079E-48FF-8F27-9C2605A29F52");
@@ -948,6 +1093,9 @@ Characteristic.EveDuration = function () {
 }
 util.inherits(Characteristic.EveDuration, Characteristic);
 Characteristic.EveDuration.UUID = "E863F12D-079E-48FF-8F27-9C2605A29F52";
+
+// "E863F122-079E-48FF-8F27-9C2605A29F52" - humidity
+// "E863F108-079E-48FF-8F27-9C2605A29F52" - temperature
 
 // EveHomeHistory Service
 Service.EveHomeHistory = function(displayName, subtype) {
