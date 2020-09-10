@@ -1,7 +1,7 @@
 // HAP-Nodejs Nest devices in HomeKit
 //
 // Supported:
-// -- Nest Thermostat, includes custom integration of hydronic system for heating and daikin A/C (wifi controlled) for cooling centrally controlled from Nest
+// -- Nest Thermostat, includes custom integration of daikin A/C (wifi controlled) for cooling centrally controlled from Nest
 // -- Nest Temperature Sensors
 // -- Nest Protect
 // -- Nest Hello
@@ -14,15 +14,19 @@
 // todo
 // -- 2FA due to Nest changes end of May 2020??
 // -- add Nest home name to pairing names (easier for mutiple homes)??
-// -- mechanism to execlute devices from HomeKit publishing??
+// -- Google auth???? Not worried yet as only use Nest auth
 //
 // -- Nest Cam(s)
-//      -- Add support once doorbell code working (may need devcie to test)
+//      -- Add support once doorbell code working (may need device to test)
 //
 // -- Nest Hello (doorbell?)
 //      -- Subscribe to events??? firebase cloud messaging??
 //      -- Reconfiguration of HomeKit streaming details
 //      -- Battery level details. Maybe just remove battery service??
+//      -- Add face detection alerting
+//      -- Add package detection alerting
+//      -- Add motion alerting (would be quite "chatty")
+//      -- Home/Away???
 //
 // -- Nest Thermostat
 //      -- Fan service - dynamic add/remove also
@@ -37,6 +41,8 @@
 //      -- CO levels
 //
 // done
+// -- external configuration file
+// -- mechanism to exclude devices from HomeKit publishing
 // -- periodically refresh Nest token expiry time
 // -- history recording - testing of own solution
 // -- dymanically removed/add accessories when added/removed from Nest app
@@ -76,7 +82,7 @@
 //    Access token can be view by logging in to https//home.nest.com on webbrowser then in going to https://home.nest.com/session  Seems access token expires every 30days
 //    so needs manually updating (havent seen it expire yet.....)
 //
-// Version 14/8/2020
+// Version 10/9/2020
 // Mark Hulskamp
 
 module.exports = accessories = [];
@@ -101,30 +107,53 @@ var {spawn} = require("child_process");
 // Defines for the accessory
 const AccessoryName =  "NEST";
 const AccessoryPincode = "031-45-154";
-const ACCESSTOKEN = "<<Access tokem here>>";
 const USERAGENT = "Nest/5.54.0.3 (iOScom.nestlabs.jasper.release) os=14.0";
 const PUTURL = "/v2/put";
 const SUBSCRIBEURL = "/v6/subscribe";
 const MFAURL = "/api/0.1/2fa/verify_pin";
 const CAMERAAPIHOST = "https://webapi.camera.home.nest.com";
-const EVENTCOOLDOWN = 60000;                     // Nest camera alert cooldown. Default 1min
+const EVENTCOOLDOWN1 = 60000;                    // Nest camera alert cooldown, 1 min
+const EVENTCOOLDOWN2 = 120000;                   // Nest camera alert cooldown. 2 min
 const VIDEOCODEC = "h264_omx";                   // h264_omx hw accel on raspberry pi (or libx264 for software)
 const AUDIOCODEC = "libfdk_aac";
 
-const DAIKIN_IP = "xxx.xxx.xxx.xxx";                  // IP for Daikin A/C system for cooling mode
+class NestClass {
+	constructor() {
+        this.__nestToken = null;                    // Access token for requests
+        this.__nestCookie = null;                   // WEBSITE_2 cookie. used for camera requests
+        this.__nestURL = null;                      // URL for nest requests
+        this.__nestID = null;                       // User ID
+        this.__tokenExpire = null;                  // Time when token expires (in Unix timestamp)
+        this.__tokenTimer = null;                   // Handle for token refresh timer
+        this.__lastNestData = {};                   // Full copy of nest data
+        this.__previousNestData = {};
+        this.__currentNestData = {};
+        this.__subscribed = [];                     // array of subscribed callbacks for each device
+        this.__excludedDevices = [];                // array of excluded devices (by serial number). We don't process these devices
+        this.__extraOptions = {};                   // Extra options per device to inject into Nest data stream
+        this.__cancel = null;
 
-function NestClass() {
-    this.__nestToken = null;                    // Access token for requests
-    this.__nestCookie = null;                   // WEBSITE_2 cookie
-    this.__nestURL = null;                      // URL for nest requests
-    this.__nestID = null;                       // User ID
-    this.__tokenExpire = null;                  // Time when token expires (in Unix timestamp)
-    this.__tokenTimer = null;                   // Handle for token refresh timer
-    this.__lastNestData = {};                   // Full copy of nest data
-    this.__previousNestData = {};
-    this.__currentNestData = {};
-    this.__subscribed = [];                     // array of subscribed callbacks for each device
-    this.__cancel = null;
+        // Load configuration
+        if (fs.existsSync(__dirname + "/Nest_config.json")) {
+            var config = require(__dirname + "/Nest_config.json");
+
+            config && Object.entries(config).forEach(([key, value]) => {
+                // Process configuration items
+                if (key.toUpperCase() == "SESSIONTOKEN") this.__nestToken = value;  // Session token to use for Nest calls
+                if (typeof value == "object") {
+                    // Assume since key value is an object, its a device configuration for matching serial number
+                    this.__extraOptions[key.toUpperCase()] = {};
+                    Object.entries(value).forEach(([subKey, value]) => {
+                        if (subKey.toUpperCase() == "EXCLUDE" && typeof value == "boolean" && value == true) this.__excludedDevices.push(key.toUpperCase());    // Push this devices serial number onto our list
+                        if (subKey.split('.')[0].toUpperCase() == "OPTION" && subKey.split('.')[1]) {
+                            // device option we'll insert into the Nest data. also allows us to override existing Nest data for the device, such as MAC address etc
+                            this.__extraOptions[key.toUpperCase()][subKey.split('.')[1]] = value;
+                        }
+                    });
+                }
+            });
+        }        
+    }
 }
 
 // Create the thermostat object
@@ -139,7 +168,6 @@ function ThermostatClass() {
     this.__nestHasFan = null;
     this.__nestDeviceID = null;                 // Nest device ID for this Nest Thermostat
     this.__updatingHomeKit = false;             // Flag if were doing an HomeKit or not
-    this.__DaikinActive = false;                // Track if we've turned hteh AC on or off
     this.historyService = null;                 // History logging service
 }
 
@@ -172,6 +200,9 @@ function CameraClass() {
     this.__nestDeviceID = null;                 // Nest device ID for this Nest Hello/Cam(s)
     this.__updatingHomeKit = false;             // Flag if were doing an HomeKit or not
     this.rangDoorbell = false;
+    this.personDetected = false;
+    this.packageDetected = false;
+    this.faceDetected = false;
     this.snapshotEvent = {type: "", time: 0, id: 0, "done": false};
     this.historyService = null;                 // History logging service
     this.pendingSessions = [];                      
@@ -400,7 +431,7 @@ ThermostatClass.prototype.updateHomeKit = function(HomeKitAccessory, thisNestDev
             if (thisNestDevice.hvac_mode.toUpperCase() == "COOL") {
                 this.__ThermostatService.getCharacteristic(Characteristic.TargetTemperature).updateValue(thisNestDevice.target_temperature);
                 this.__ThermostatService.getCharacteristic(Characteristic.TargetHeatingCoolingState).updateValue(Characteristic.TargetHeatingCoolingState.COOL);
-                historyEntry.target = {low: hisNestDevice.target_temperature, high: 0};    // single target temperature for heating limit
+                historyEntry.target = {low: thisNestDevice.target_temperature, high: 0};    // single target temperature for heating limit
             }
             if (thisNestDevice.hvac_mode.toUpperCase() == "RANGE") {
                 this.__ThermostatService.getCharacteristic(Characteristic.HeatingThresholdTemperature).updateValue(thisNestDevice.target_temperature_low);
@@ -415,42 +446,71 @@ ThermostatClass.prototype.updateHomeKit = function(HomeKitAccessory, thisNestDev
 
             // Update current state
             if (thisNestDevice.hvac_state.toUpperCase() == "HEATING") {
-                if (thisNestDevice.can_heat == true) {
-                    if ((thisNestDevice.can_cool == true && thisNestDevice.previous_hvac_state.toUpperCase() == "COOLING") && this.__DaikinActive == true) {
-                        // Switched to heating mode from cooling mode, so stop aircon
-                        this.setDaikinAC(0, 3, thisNestDevice.target_temperature_high, 0, "A", 3);
-                    }
-                    this.__ThermostatService.getCharacteristic(Characteristic.CurrentHeatingCoolingState).updateValue(Characteristic.CurrentHeatingCoolingState.HEAT);
-                    historyEntry.status = 2;    // heating
+                if (thisNestDevice.previous_hvac_state.toUpperCase() == "COOLING" && thisNestDevice.coolingURL) {
+                    // Switched to heating mode and external cooling URL was being used, so stop cooling via cooling URL
+                    this.setDaikinAC(thisNestDevice.coolingURL, 0, 3, thisNestDevice.target_temperature_high, 0, "A", 3);
+                } else if (thisNestDevice.previous_hvac_state.toUpperCase() == "FAN" && thisNestDevice.fanURL) {
+                    // Switched to heating mode and external fan URL was being used, so stop fan via fan URL
+                    this.setDaikinAC(thisNestDevice.fanURL, 0, 3, thisNestDevice.target_temperature_high, 0, "A", 3);
                 }
+                if (thisNestDevice.previous_hvac_state.toUpperCase() != "HEATING" && thisNestDevice.heatingURL) {
+                    // Switched to heating mode and external heating URL is being used, so start heating via heating URL
+                    // Insert code here to startup external heating source
+                }
+
+                this.__ThermostatService.getCharacteristic(Characteristic.CurrentHeatingCoolingState).updateValue(Characteristic.CurrentHeatingCoolingState.HEAT);
+                historyEntry.status = 2;    // heating
             }
             if (thisNestDevice.hvac_state.toUpperCase() == "COOLING") {
-                if (thisNestDevice.can_cool == true) {
-                    // Switched to cooling mode, so start up aircon
-                    this.setDaikinAC(1, 3, this.__ThermostatService.getCharacteristic(Characteristic.TargetTemperature).value, 0, "A", 3);
-                    this.__ThermostatService.getCharacteristic(Characteristic.CurrentHeatingCoolingState).updateValue(Characteristic.CurrentHeatingCoolingState.COOL);
-                    historyEntry.status = 3;    // cooling
+                if (thisNestDevice.previous_hvac_state.toUpperCase() == "HEATING" && thisNestDevice.heatingURL) {
+                    // Switched to cooling mode and external heating URL was being used, so stop heating via heating URL
+                    // Insert code here to stop external heating source
+                } else if (thisNestDevice.previous_hvac_state.toUpperCase() == "FAN" && thisNestDevice.fanURL) {
+                    // Switched to cooling mode and external fan URL was being used, so stop fan via fan URL
+                    this.setDaikinAC(thisNestDevice.fanURL, 0, 3, thisNestDevice.target_temperature_high, 0, "A", 3);
                 }
+
+                if (thisNestDevice.previous_hvac_state.toUpperCase() != "COOLING" && thisNestDevice.coolingURL) {
+                    // Switched to cooling mode and external cooling URL is being used, so start cooling via cooling URL
+                    this.setDaikinAC(thisNestDevice.coolingURL, 1, 3, this.__ThermostatService.getCharacteristic(Characteristic.TargetTemperature).value, 0, "A", 3);
+                }
+                this.__ThermostatService.getCharacteristic(Characteristic.CurrentHeatingCoolingState).updateValue(Characteristic.CurrentHeatingCoolingState.COOL);
+                historyEntry.status = 3;    // cooling
             }
             if (thisNestDevice.hvac_state.toUpperCase() == "OFF") {
-                if (thisNestDevice.can_cool == true) {
-                    if ((thisNestDevice.previous_hvac_state.toUpperCase() == "COOLING" || thisNestDevice.previous_hvac_state.toUpperCase() == "FAN") && this.__DaikinActive == true) {
-                        // Currently switched to off, so stop aircon if previous mode was cooling and/or fan was running
-                        this.setDaikinAC(0, 3, thisNestDevice.target_temperature_high, 0, "A", 3);
-                    }
+                if (thisNestDevice.previous_hvac_state.toUpperCase() == "COOLING" && thisNestDevice.coolingURL) {
+                    // Switched to off mode and external cooling URL was being used, so stop cooling via cooling URL
+                    this.setDaikinAC(thisNestDevice.coolingURL, 0, 3, thisNestDevice.target_temperature_high, 0, "A", 3);
+                } else if (thisNestDevice.previous_hvac_state.toUpperCase() == "FAN" && thisNestDevice.fanURL) {
+                    // Switched to off mode and external fan URL was being used, so stop fan via fan URL
+                    this.setDaikinAC(thisNestDevice.fanURL, 0, 3, thisNestDevice.target_temperature_high, 0, "A", 3);
+                }
+
+                if (thisNestDevice.previous_hvac_state.toUpperCase() == "HEATING" && thisNestDevice.heatingURL) {
+                    // Switched to off mode and external heating URL was being used, so stop heating via heating URL
+                    // Insert code here to stop external heating source
                 }
                 this.__ThermostatService.getCharacteristic(Characteristic.CurrentHeatingCoolingState).updateValue(Characteristic.CurrentHeatingCoolingState.OFF);
                 historyEntry.status = 0;    // off
             }
             if (thisNestDevice.hvac_state.toUpperCase() == "FAN") {
-                // Fan configured. work out status of fan from thermostat and start/stop on the Daikin as required
-                if (thisNestDevice.has_fan == true && this.__DaikinActive == false) {
-                    this.setDaikinAC(1, 6, "--", "--", "A", 3);
-
-                    // Report to HomeKit current mode is "OFF" as there is no seprate FAN linked.
-                    this.__ThermostatService.getCharacteristic(Characteristic.CurrentHeatingCoolingState).updateValue(Characteristic.CurrentHeatingCoolingState.OFF);
-                    historyEntry.status = 1;    // fan
+                if (thisNestDevice.previous_hvac_state.toUpperCase() == "HEATING" && thisNestDevice.heatingURL) {
+                    // Switched to fan mode and external heating URL was being used, so stop heating via heating URL
+                    // Insert code here to stop external heating source
+                } else if (thisNestDevice.previous_hvac_state.toUpperCase() == "COOLING" && thisNestDevice.coolingURL) {
+                    // Switched to fan mode and external cooling URL was being used, so stop cooling via cooling URL
+                    this.setDaikinAC(thisNestDevice.coolingURL, 0, 3, thisNestDevice.target_temperature_high, 0, "A", 3);
                 }
+
+                if (thisNestDevice.previous_hvac_state.toUpperCase() != "FAN" && thisNestDevice.fanURL) {
+                    // Switched to fan mode and external fan URL is being used, so start fan via fan URL
+                    thisNestDevice.fanURL && this.setDaikinAC(thisNestDevice.fanURL, 1, 6, "--", "--", "A", 3);
+                }
+
+                // Report to HomeKit current mode is "OFF" as there is no seprate FAN linked.
+                this.__ThermostatService.getCharacteristic(Characteristic.CurrentHeatingCoolingState).updateValue(Characteristic.CurrentHeatingCoolingState.OFF);
+                historyEntry.status = 1;    // fan
+
                 // TODO --- Something to update HomeKit for a fan going. Probably needs a fan servce or something.
             }
 
@@ -468,15 +528,14 @@ ThermostatClass.prototype.updateHomeKit = function(HomeKitAccessory, thisNestDev
     }
 }
     
-ThermostatClass.prototype.setDaikinAC = function(daikinPwr, daikinMode, daikinTemp, daikinHumid, daikinFanSpeed, daikinFanMode) {
-    axios.get("http://" + DAIKIN_IP + "/aircon/set_control_info?pow=" + daikinPwr + "&mode=" + daikinMode + "&stemp=" + daikinTemp + "&shum=" + daikinHumid + "&f_rate=" + daikinFanSpeed + "&f_dir=" + daikinFanMode)
+ThermostatClass.prototype.setDaikinAC = async function(daikinURL, daikinPwr, daikinMode, daikinTemp, daikinHumid, daikinFanSpeed, daikinFanMode) {
+    await axios.get(daikinURL + "/aircon/set_control_info?pow=" + daikinPwr + "&mode=" + daikinMode + "&stemp=" + daikinTemp + "&shum=" + daikinHumid + "&f_rate=" + daikinFanSpeed + "&f_dir=" + daikinFanMode)
     .then(response => {
         if (response.status == 200) {
-            this.__DaikinActive = (daikinPwr == 1) ? true : false;  // update if Daikin on or off
             console.log("setDaikinAC Pwr: '%s' Mode: '%s' Temp: '%s' Fan Mode: '%s' Fan Speed: '%s'", daikinPwr, daikinMode, daikinTemp, daikinFanMode, daikinFanSpeed);
         }
     })
-    .catch(error => console.log("DEBUG: " + arguments.callee.name, AccessoryName, error.message));
+    .catch(error => console.log("DEBUG: setDaikinAC failed", error.message));
 }
 
 
@@ -619,7 +678,7 @@ CameraClass.prototype.addDoorbell = function(HomeKitAccessory, thisServiceName, 
                     [320, 180, 30],
                 ],
                 codec: {
-                    profiles : [0, 1, 2], //H264Profile.HIGH = 0x02, as default profile in streamer is VIDEO_H264_2MBIT_L40
+                    profiles : [0, 1, 2], // H264Profile.HIGH = 0x02, as default profile in streamer is VIDEO_H264_2MBIT_L40
                     levels: [0, 1, 2], // H264Level.LEVEL4_0 = 0x02, as Default level in streamer is VIDEO_H264_2MBIT_L40
                 },
             },
@@ -627,8 +686,8 @@ CameraClass.prototype.addDoorbell = function(HomeKitAccessory, thisServiceName, 
                 twoWayAudio: (parseInt(thisNestDevice.software_version) >= 4110019 ? true : false),  // Nest Hello enabled two/way audio in firmware 4110019 or later
                 codecs: [
                     {
-                        type: "AAC-eld", //AudioStreamingCodecType.AAC_ELD
-                        samplerate: 16, //AudioStreamingSamplerate.KHZ_16, AudioStreamingSamplerate.KHZ_24
+                        type: "AAC-eld", // AudioStreamingCodecType.AAC_ELD
+                        samplerate: 16, // AudioStreamingSamplerate.KHZ_16
                     },
                 ], 
             },
@@ -643,9 +702,9 @@ CameraClass.prototype.addDoorbell = function(HomeKitAccessory, thisServiceName, 
     // Commented out until we can get proper battery level information from Nest Hello/Cam(s)
     //this.__BatteryService = HomeKitAccessory.addService(Service.BatteryService, "", serviceNumber);
 
-    // Motion service(s) for doorbell. Zone id of 0 is the sensor on camera/doorbell
+    // Motion service(s) for doorbell. Zone id of 0 is the main sensor zone on camera/doorbell
     thisNestDevice.activity_zones.forEach(zone => {
-        var tempService = HomeKitAccessory.addService(Service.MotionSensor, (zone.id == 0 ? thisServiceName : zone.name), (zone.id == 0 ? 1 : zone.id));
+        var tempService = HomeKitAccessory.addService(Service.MotionSensor, (zone.id == 0 ? thisServiceName : zone.name), zone.id);
         this.__MotionServices.push({"service": tempService, "id": zone.id})
     });
 
@@ -662,8 +721,10 @@ CameraClass.prototype.handleSnapshotRequest = async function(request, callback) 
     var imageBuffer = null;
     if (this.__nestDeviceID != null && typeof this.__nestObject.__currentNestData.device[this.__nestDeviceID] == "object") {
         if (this.__nestObject.__currentNestData.device[this.__nestDeviceID] && this.__nestObject.__currentNestData.device[this.__nestDeviceID].streaming_enabled == true && this.__nestObject.__currentNestData.device[this.__nestDeviceID].online == true) { 
-            // grab snapshot from camera stream. If we have an current event, get teh snpashot for that event
+            // grab snapshot from camera stream. If we have an current event, get the snpashot for that event
             if (this.snapshotEvent.type != "" && this.snapshotEvent.done == false) {
+                // TODO - pass event "short" video as notification rather than still image. Possible??
+                //await axios.get(this.__nestObject.__currentNestData.device[this.__nestDeviceID].nexus_api_http_server_url + "/get_event_clip?uuid=" + this.__nestObject.__currentNestData.device[this.__nestDeviceID].camera_uuid + "&cuepoint_id=" + this.snapshotEvent.id + "&num_frames=10&format=mp4&width=" + request.width, {responseType: "arraybuffer", headers: {"user-agent": USERAGENT, "cookie": "website_2=" + this.__nestObject.__nestCookie} })
                 await axios.get(this.__nestObject.__currentNestData.device[this.__nestDeviceID].nexus_api_http_server_url + "/event_snapshot/" + this.__nestObject.__currentNestData.device[this.__nestDeviceID].camera_uuid + "/" + this.snapshotEvent.id + "?crop_type=timeline&width=" + request.width, {responseType: "arraybuffer", headers: {"user-agent": USERAGENT, "cookie": "website_2=" + this.__nestObject.__nestCookie} })
                 .then(response => {
                     if (response.status = 200) {
@@ -720,7 +781,8 @@ CameraClass.prototype.prepareStream = async function(request, callback) {
     var sessionInfo = {
         HomeKitSessionID: request.sessionID,  // Store session ID
         address: request.targetAddress,
-        videoPort: request.video.port,  // await getPort(), // Dont think we need to assign a seperate video port??
+        videoPort: request.video.port,
+        localVideoPort: await getPort(),
         videoCryptoSuite: request.video.srtpCryptoSuite,
         videoSRTP: Buffer.concat([request.video.srtp_key, request.video.srtp_salt]),
         videoSSRC: this.__doorbellController != null ? DoorbellController.generateSynchronisationSource() : CameraController.generateSynchronisationSource(),
@@ -761,7 +823,7 @@ CameraClass.prototype.prepareStream = async function(request, callback) {
     var response = {
         address: ip.address("public", request.addressVersion), // ip Address version must match
         video: {
-            port: sessionInfo.videoPort,
+            port: sessionInfo.localVideoPort,
             ssrc: sessionInfo.videoSSRC,
             srtp_key: request.video.srtp_key,
             srtp_salt: request.video.srtp_salt,
@@ -789,7 +851,7 @@ CameraClass.prototype.handleStreamRequest = function (request, callback) {
             this.ongoingSessions[request.sessionID].ffmpegAudio = ffmpegAudio.ffmpegAudio;  // Store ffmpeg audio process ID
             this.ongoingSessions[request.sessionID].ffmpegAudioReturn = ffmpegAudio.ffmpegAudioReturn;  // Store ffmpeg audio return process ID
             this.ongoingSessions[request.sessionID].video = request.video;  // Cache the video request details
-            this.ongoingSessions[request.sessionID].audio = request.audio;  // Cache the video request details
+            this.ongoingSessions[request.sessionID].audio = request.audio;  // Cache the audio request details
             delete this.pendingSessions[request.sessionID]; // remove this pending session information
 
             // Start streaming from doorbell/camera
@@ -819,22 +881,6 @@ CameraClass.prototype.handleStreamRequest = function (request, callback) {
 
         case "reconfigure" : {
             // todo - implement???
-     /*       if (request.video && typeof request.video == "object") {
-                    // request to reconfigure video stream
-                if (this.ongoingSessions[request.sessionID].ffmpegVideo != null) this.ongoingSessions[request.sessionID].ffmpegVideo.kill('SIGKILL');   // kill current ffmpeg process before we start new one
-                request.video.pt = this.ongoingSessions[request.sessionID].video.pt; // request doesn't have payloadType, so use cached
-                request.video.mtu = this.ongoingSessions[request.sessionID].video.mtu;    // request doesn't have MTU, so use cached
-                var ffmpegVideo = this.__buildVideoStream(request.video, this.ongoingSessions[request.sessionID], callback);
-                this.ongoingSessions[request.sessionID].ffmpegVideo = ffmpegVideo;  // new ffmpeg video process ID for reconfigured stream
-            }
-            if (request.audio && typeof request.audio == "object") {
-                // request to reconfigure audio stream(s)
-                console.log("audio reconfig", request.audio)
-                if (this.ongoingSessions[request.sessionID].ffmpegAudio.ffmpegAudio != null) this.ongoingSessions[request.sessionID].ffmpegAudio.ffmpegAudio.kill('SIGKILL');   // kill current ffmpeg process before we start new one
-                if (this.ongoingSessions[request.sessionID].ffmpegAudio.ffmpegAudioReturn != null) this.ongoingSessions[request.sessionID].ffmpegAudio.ffmpegAudioReturn.kill('SIGKILL');   // kill current ffmpeg process before we start new one
-                var ffmpegAudio = this.__buildAudioStream(request.audio, this.pendingSessions[request.sessionID], callback);
-                this.ongoingSessions[request.sessionID].ffmpegAudio = ffmpegAudio;  // new ffmpeg audio process ID for reconfigured stream
-            } */
             callback();
             break;
         }
@@ -849,15 +895,16 @@ CameraClass.prototype.updateHomeKit = function(HomeKitAccessory, thisNestDevice)
         if (this.__cameraController != null) this.__cameraController.cameraService.getCharacteristic(Characteristic.StatusActive).updateValue(thisNestDevice.online == true ? true : false);  // If Nest isn't online, report in HomeKits
 
         // Update battery level
-        // todo - get actually battery details. Doesn't appear to work, so we dont create the service when adding
         if (this.__BatteryService != null) {
-            var tempBatteryLevel = __scale(thisNestDevice.battery_level, 0, 100, 0, 100);
+            // todo - get actually battery details. Doesn't appear to work, so we dont create the service when adding
+            //var tempBatteryLevel = __scale(thisNestDevice.battery_level, 0, 100, 0, 100);
+            var tempBatteryLevel = 100;
             this.__BatteryService.getCharacteristic(Characteristic.BatteryLevel).updateValue(tempBatteryLevel);
             this.__BatteryService.getCharacteristic(Characteristic.StatusLowBattery).updateValue(tempBatteryLevel > 5 ? Characteristic.StatusLowBattery.BATTERY_LEVEL_NORMAL : Characteristic.StatusLowBattery.BATTERY_LEVEL_LOW);
             this.__BatteryService.getCharacteristic(Characteristic.ChargingState).updateValue(thisNestDevice.battery_charging_state == true ? Characteristic.ChargingState.CHARGING : Characteristic.ChargingState.NOT_CHARGING);
         }
 
-        // Streaming enabled/disabled/turned off etc If currently streaming, we need to reconfigure stream
+        // Streaming enabled/disabled/turned off etc. If currently streaming, we need to reconfigure stream
         this.ongoingStreams && Object.entries(this.ongoingStreams).forEach(([sessionID, stream]) => {
             stream.reconfigureStream(this.__nestObject.__nestCookie, thisNestDevice, this.ongoingSessions[sessionID].ffmpegVideo, this.ongoingSessions[sessionID].ffmpegVideo, this.ongoingSessions[sessionID].ffmpegAudioReturn);
         });
@@ -865,7 +912,7 @@ CameraClass.prototype.updateHomeKit = function(HomeKitAccessory, thisNestDevice)
         // Process activity zones to see if any were removed or added.
         thisNestDevice.activity_zones.forEach(zone => {
             if (zone.id != 0) {
-                var index = this.__MotionServices.findIndex( ({ id }) => id && id == zone.id);
+                var index = this.__MotionServices.findIndex( ({ id }) => id == zone.id);
                 if (index == -1) {
                     // Zone doesn't have an associated motion sensor, so add one
                     var tempService = HomeKitAccessory.addService(Service.MotionSensor, zone.name, zone.id);
@@ -879,7 +926,7 @@ CameraClass.prototype.updateHomeKit = function(HomeKitAccessory, thisNestDevice)
 
         this.__MotionServices.forEach((motionService, index) => {
             if (motionService.id != 0) {
-                if (thisNestDevice.activity_zones.findIndex( ({ id }) => id && id == motionService.id) == -1) {
+                if (thisNestDevice.activity_zones.findIndex( ({ id }) => id == motionService.id) == -1) {
                     // Motion service we created doesn't appear in zone list anymore, so assume deleted
                     HomeKitAccessory.removeService(motionService.service);
                     this.__MotionServices.splice(index, 1);
@@ -890,18 +937,50 @@ CameraClass.prototype.updateHomeKit = function(HomeKitAccessory, thisNestDevice)
         // Process alerts after current activity zones are processed
         thisNestDevice.current_alert.forEach(event => {
             if (event.types.includes("doorbell") == true && event.is_important == true) {
-                if (this.rangDoorbell == false && this.__doorbellController != null) {
+                if (this.__doorbellController != null && this.rangDoorbell == false) {
                     // Doorbell button pressed and we haven't trigger the doorbell button on the HomeKit service
-                    this.rangDoorbell = true;
                     this.__doorbellController.ringDoorbell();
+                    this.rangDoorbell = true;
                     this.snapshotEvent = {type: "ring", time: event.playback_time, id : event.id, done: false};
       
                     if (this.historyService != null) this.historyService.addHistory(this.__doorbellController.doorbellService, {time: Math.floor(new Date() / 1000), status: 1});
 
                     setTimeout(function () {
-                        this.rangDoorbell == false; // Cool down for doorbell press finished
-                    }.bind(this), EVENTCOOLDOWN);
+                        this.rangDoorbell = false; // Cool down for doorbell press finished
+                    }.bind(this), EVENTCOOLDOWN1);
                 }
+            }
+
+            if (event.types.includes("person") == true && event.is_important == true) {
+                if (this.rangDoorbell == false && this.personDetected == false) {
+                    this.personDetected = true;
+                    this.snapshotEvent = {type: "person", time: event.playback_time, id : event.id, done: false};
+
+                    event.zone_ids.forEach(zoneID => {
+                        var index = this.__MotionServices.findIndex( ({ id }) => id == zoneID);
+                        if (index != -1) {
+                            this.__MotionServices[index].service.getCharacteristic(Characteristic.MotionDetected).updateValue(true);    // Trigger motion for matching zone
+                        }
+                    });
+
+                    setTimeout(function () {
+                        this.personDetected = false; // Cool down for person being detected finished
+                        this.__MotionServices.forEach((motionService, index) => { 
+                            motionService.service.getCharacteristic(Characteristic.MotionDetected).updateValue(false);  // clear any motion
+                        });
+                    }.bind(this), EVENTCOOLDOWN2);
+                }
+            }
+
+            if (event.types.includes("person") == true && this.personDetected == false) {
+                console.log("Person, but not importart???")
+                console.log(event)
+            }
+
+            if (event.types.includes("motion") == true && event.is_important == true) {
+            }
+
+            if (event.types.includes("sound") == true && event.is_important == true) {
             }
         });
     }
@@ -912,6 +991,7 @@ CameraClass.prototype.__buildVideoStream = function(request, sessionInfo, callba
         + " -use_wallclock_as_timestamps 1"
         + " -i pipe:"
         + " -c copy"    // Appears since we have a H264 stream, shouldn't need to transcode, so just copy the stream
+        + " -map 0:0"
         ///+ " -c:v " + VIDEOCODEC  // h264_omx hw accel on raspberry pi (or libx264 for software)
         + " -preset ultrafast"
         + " -tune zerolatency"
@@ -925,7 +1005,7 @@ CameraClass.prototype.__buildVideoStream = function(request, sessionInfo, callba
         + " -f rtp"
         + " -srtp_out_suite AES_CM_128_HMAC_SHA1_80"
         + " -srtp_out_params " + sessionInfo.videoSRTP.toString("base64")
-        + " srtp://" + sessionInfo.address + ":" + sessionInfo.videoPort + "?rtcpport=" + sessionInfo.videoPort + "&localrtcpport=" + sessionInfo.videoPort + "&pkt_size=" + request.mtu;
+        + " srtp://" + sessionInfo.address + ":" + sessionInfo.videoPort + "?rtcpport=" + sessionInfo.videoPort + "&localrtcpport=" + sessionInfo.localVideoPort + "&pkt_size=" + request.mtu;
 
     var ffmpegStarted = false;
     var ffmpegVideo = spawn("ffmpeg", ffmpegCommand.split(" "), { env: process.env });
@@ -1013,7 +1093,7 @@ CameraClass.prototype.__buildAudioStream = function(request, sessionInfo, callba
         + "c=IN IP4 " + sessionInfo.address + "\n"
         + "t=0 0\n"
         + "a=tool:libavformat 58.38.100\n"
-        + "m=audio " + sessionInfo.twoWayAudioPort +" RTP/AVP 110\n"
+        + "m=audio " + sessionInfo.twoWayAudioPort + " RTP/AVP 110\n"
         + "b=AS:24\n"
         + "a=rtpmap:110 MPEG4-GENERIC/16000/1\n"
         + "a=fmtp:110 profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3; config=F8F0212C00BC00\n"
@@ -1025,16 +1105,16 @@ CameraClass.prototype.__buildAudioStream = function(request, sessionInfo, callba
 
 // Nest object
 NestClass.prototype.doLogin = async function(tokenRefresh) {
-    if ((tokenRefresh && tokenRefresh == true) || this.__nestToken == null || this.__nestURL == null || this.__nestID == null || this.__nestCookie == null) {
-        await axios.get("https://home.nest.com/session", {headers: {"user-agent": USERAGENT, "Authorization": "Basic " + ACCESSTOKEN} })
+    if ((tokenRefresh && tokenRefresh == true) || this.__nestToken != null || this.__nestURL == null || this.__nestID == null || this.__nestCookie == null) {
+        await axios.get("https://home.nest.com/session", {headers: {"user-agent": USERAGENT, "Authorization": "Basic " + this.__nestToken} })
         .then(async (response) => {
             if (response.status == 200) {
-                this.__nestToken = response.data.access_token;
+                //this.__nestToken = response.data.access_token;    // Token from response SHOULD be the same as whats inour configuration, so no need to update internal token??
                 this.__nestURL = response.data.urls.transport_url;
                 this.__nestID = response.data.userid;
                 this.__tokenExpire = Math.floor(new Date(response.data.expires_in) / 1000);
 
-                // Set timer to refresh access token expiry time/date if we havent started it
+                // Set timer to refresh access token expiry time/date if we havent started one yet
                 if (this.__tokenTimer == null) {
                     this.__tokenTimer = setInterval(async function() {
                         this.doLogin(true);
@@ -1045,7 +1125,7 @@ NestClass.prototype.doLogin = async function(tokenRefresh) {
         .catch(error => {
             if (error.status == 400) {
                 // Invalid access token
-                console.log("DEBUG: Invalid token")
+                console.log("DEBUG: Invalid Nest Session Token")
             } else if (error.status == 401 && error.response && error.response.data && error.response.data.truncated_phone_number) {
                 // 2FA required. prompt user to input PIN recieved to phone
                 console.log("DEBUG: 2FA enabled");
@@ -1057,15 +1137,17 @@ NestClass.prototype.doLogin = async function(tokenRefresh) {
         });
 
         // need the WEBSITE_2 cookie for camera API requests
-        await axios.post(CAMERAAPIHOST + "/api/v1/login.login_nest", Buffer.from("access_token=" + ACCESSTOKEN, "utf8"), {withCredentials: true, headers: {"referer": "https://home.nest.com", "Content-Type": "application/x-www-form-urlencoded", "user-agent": USERAGENT} })
-        .then(response => {
-            if (response.status == 200 && response.data && response.data.status == 0) {
-                this.__nestCookie = response.data.items[0].session_token;    // WEBSITE_2 cookie
-            }
-        })
-        .catch(error => {
-            console.log("DEBUG: Failed to get WEBSITE_2 cookie", error);
-        });
+        if (this.__nestToken != null) {
+            await axios.post(CAMERAAPIHOST + "/api/v1/login.login_nest", Buffer.from("access_token=" + this.__nestToken, "utf8"), {withCredentials: true, headers: {"referer": "https://home.nest.com", "Content-Type": "application/x-www-form-urlencoded", "user-agent": USERAGENT} })
+            .then(response => {
+                if (response.status == 200 && response.data && response.data.status == 0) {
+                    this.__nestCookie = response.data.items[0].session_token;    // WEBSITE_2 cookie
+                }
+            })
+            .catch(error => {
+                console.log("DEBUG: Failed to get WEBSITE_2 cookie", error);
+            });
+        }
     }
 }
 
@@ -1095,7 +1177,8 @@ NestClass.prototype.getNestData = async function(process) {
         })
         .finally(() => {
         })
-        .catch(error => {console.log("DEBUG: " + arguments.callee.name, AccessoryName, error.message)});
+        .catch(error => {
+        });
     }
 }
 
@@ -1163,221 +1246,272 @@ NestClass.prototype.__processNestData = async function(nestData, onlyID) {
 
         nestData.device && Object.entries(nestData.device).forEach(([deviceID, thermostat]) => {
             // process thermostats
-            this.__currentNestData.device[thermostat.serial_number] = {};
-            this.__currentNestData.device[thermostat.serial_number].device_type = "thermostat";  // nest thermostat
-            this.__currentNestData.device[thermostat.serial_number].orgNestStructure = "device." + deviceID;
-            this.__currentNestData.device[thermostat.serial_number].software_version = thermostat.current_version.replace(/-/g, "."); // fix software version for HomeKit
-            this.__currentNestData.device[thermostat.serial_number].mac_address= thermostat.mac_address.toUpperCase();
-            this.__currentNestData.device[thermostat.serial_number].current_humidity = thermostat.current_humidity;
-            this.__currentNestData.device[thermostat.serial_number].temperature_scale = thermostat.temperature_scale;
-            this.__currentNestData.device[thermostat.serial_number].backplate_temperature = thermostat.backplate_temperature;
-            this.__currentNestData.device[thermostat.serial_number].battery_level = thermostat.battery_level;
-            this.__currentNestData.device[thermostat.serial_number].serial_number = thermostat.serial_number;
-            this.__currentNestData.device[thermostat.serial_number].online = nestData.track[thermostat.serial_number].online;
-            this.__currentNestData.device[thermostat.serial_number].has_fan = thermostat.has_fan;
-            this.__currentNestData.device[thermostat.serial_number].can_cool = nestData.shared[thermostat.serial_number].can_cool;
-            this.__currentNestData.device[thermostat.serial_number].can_heat = nestData.shared[thermostat.serial_number].can_heat;
-            this.__currentNestData.device[thermostat.serial_number].description = nestData.shared[thermostat.serial_number].hasOwnProperty("name") ? nestData.shared[thermostat.serial_number].name : "";
-            this.__currentNestData.device[thermostat.serial_number].target_temperature_type = nestData.shared[thermostat.serial_number].target_temperature_type;
-            this.__currentNestData.device[thermostat.serial_number].target_temperature = __adjustTemperature(nestData.shared[thermostat.serial_number].target_temperature, "C", "C");
-            this.__currentNestData.device[thermostat.serial_number].target_temperature_high = __adjustTemperature(nestData.shared[thermostat.serial_number].target_temperature_high, "C", "C");
-            this.__currentNestData.device[thermostat.serial_number].target_temperature_low = __adjustTemperature(nestData.shared[thermostat.serial_number].target_temperature_low, "C", "C");
-            this.__currentNestData.device[thermostat.serial_number].backplate_temperature = __adjustTemperature(thermostat.backplate_temperature, "C", "C");
-            this.__currentNestData.device[thermostat.serial_number].hvac_mode = nestData.shared[thermostat.serial_number].target_temperature_type;
-        
-            // Work out current state ie" heating, cooling etc
-            if (nestData.shared[thermostat.serial_number].hvac_heater_state == true || nestData.shared[thermostat.serial_number].hvac_heat_x2_state == true || 
-                nestData.shared[thermostat.serial_number].hvac_heat_x3_state == true || nestData.shared[thermostat.serial_number].hvac_aux_heater_state == true || 
-                nestData.shared[thermostat.serial_number].hvac_alt_heat_x2_state == true || nestData.shared[thermostat.serial_number].hvac_emer_heat_state == true ||
-                nestData.shared[thermostat.serial_number].hvac_alt_heat_state == true) {
-                
-                // A heating source is on, so we're in heating mode
-                this.__currentNestData.device[thermostat.serial_number].hvac_state = "heating";
-            }
-            if (nestData.shared[thermostat.serial_number].hvac_ac_state == true || nestData.shared[thermostat.serial_number].hvac_cool_x2_state == true || nestData.shared[thermostat.serial_number].hvac_cool_x3_state == true) {
-                
-                // A cooling source is on, so we're in cooling mode
-                this.__currentNestData.device[thermostat.serial_number].hvac_state = "cooling";
-            }
-            if (nestData.shared[thermostat.serial_number].hvac_heater_state == false && nestData.shared[thermostat.serial_number].hvac_heat_x2_state == false && 
-                nestData.shared[thermostat.serial_number].hvac_heat_x3_state == false && nestData.shared[thermostat.serial_number].hvac_aux_heater_state == false && 
-                nestData.shared[thermostat.serial_number].hvac_alt_heat_x2_state == false && nestData.shared[thermostat.serial_number].hvac_emer_heat_state == false &&
-                nestData.shared[thermostat.serial_number].hvac_alt_heat_state == false && nestData.shared[thermostat.serial_number].hvac_ac_state == false &&
-                nestData.shared[thermostat.serial_number].hvac_cool_x2_state == false && nestData.shared[thermostat.serial_number].hvac_cool_x3_state == false) {
-                
-                // No heating or cooling sources are on, so we're in off mode
-                this.__currentNestData.device[thermostat.serial_number].hvac_state = "off";
-            }
-            if (nestData.shared[thermostat.serial_number].hvac_fan_state == true) {
-                this.__currentNestData.device[thermostat.serial_number].hvac_state = "fan";
-            }
-
-            // Setup previous modes and states
-            if (typeof this.__previousNestData.device[thermostat.serial_number] != "object") {
-                this.__previousNestData.device[thermostat.serial_number] = {};
-                this.__previousNestData.device[thermostat.serial_number].hvac_mode = this.__currentNestData.device[thermostat.serial_number].hvac_mode;
-                this.__previousNestData.device[thermostat.serial_number].hvac_state = this.__currentNestData.device[thermostat.serial_number].hvac_state;
-                this.__previousNestData.device[thermostat.serial_number].previous_hvac_mode = this.__currentNestData.device[thermostat.serial_number].hvac_mode;
-                this.__previousNestData.device[thermostat.serial_number].previous_hvac_state = this.__currentNestData.device[thermostat.serial_number].hvac_state;
-                this.__previousNestData.device[thermostat.serial_number].battery_level = 0;
-                this.__currentNestData.device[thermostat.serial_number].previous_hvac_mode = this.__currentNestData.device[thermostat.serial_number].hvac_mode;
-                this.__currentNestData.device[thermostat.serial_number].previous_hvac_state = this.__currentNestData.device[thermostat.serial_number].hvac_state;
-            }
-
-            if (this.__currentNestData.device[thermostat.serial_number].hvac_mode != this.__previousNestData.device[thermostat.serial_number].hvac_mode) {
-                this.__currentNestData.device[thermostat.serial_number].previous_hvac_mode = this.__previousNestData.device[thermostat.serial_number].hvac_mode;
-            } else {
-                this.__currentNestData.device[thermostat.serial_number].previous_hvac_mode = this.__previousNestData.device[thermostat.serial_number].previous_hvac_mode;
-            }
-            if (this.__currentNestData.device[thermostat.serial_number].hvac_state != this.__previousNestData.device[thermostat.serial_number].hvac_state) {
-                this.__currentNestData.device[thermostat.serial_number].previous_hvac_state = this.__previousNestData.device[thermostat.serial_number].hvac_state;
-            } else {
-                this.__currentNestData.device[thermostat.serial_number].previous_hvac_state = this.__previousNestData.device[thermostat.serial_number].previous_hvac_state;
-            }
-
-            // Get device location name
-            this.__currentNestData.device[thermostat.serial_number].location = "";
-            nestData.where[nestData.link[thermostat.serial_number].structure.split('.')[1]].wheres.forEach(where => {
-                if (thermostat.where_id == where.where_id) {
-                    this.__currentNestData.device[thermostat.serial_number].location = where.name;
-                }
-            });
+            var tempMACAddress = thermostat.mac_address.toUpperCase();
+            tempMACAddress = tempMACAddress.substr(0,2) + ":" + tempMACAddress.substr(2,2) + ":" + tempMACAddress.substr(4,2) + ":" + tempMACAddress.substr(6,2) + ":" + tempMACAddress.substr(8,2) + ":" + tempMACAddress.substr(10,2)
+            if (this.__excludedDevices.includes(thermostat.serial_number.toUpperCase()) == false) {
+                // Device is not in excluded list, so include
+                this.__currentNestData.device[thermostat.serial_number] = {};
+                this.__currentNestData.device[thermostat.serial_number].device_type = "thermostat";  // nest thermostat
+                this.__currentNestData.device[thermostat.serial_number].orgNestStructure = "device." + deviceID;
+                this.__currentNestData.device[thermostat.serial_number].software_version = thermostat.current_version.replace(/-/g, "."); // fix software version for HomeKit
+                this.__currentNestData.device[thermostat.serial_number].mac_address = tempMACAddress;    // Our created MAC address
+                this.__currentNestData.device[thermostat.serial_number].current_humidity = thermostat.current_humidity;
+                this.__currentNestData.device[thermostat.serial_number].temperature_scale = thermostat.temperature_scale;
+                this.__currentNestData.device[thermostat.serial_number].backplate_temperature = thermostat.backplate_temperature;
+                this.__currentNestData.device[thermostat.serial_number].battery_level = thermostat.battery_level;
+                this.__currentNestData.device[thermostat.serial_number].serial_number = thermostat.serial_number.toUpperCase();
+                this.__currentNestData.device[thermostat.serial_number].online = nestData.track[thermostat.serial_number].online;
+                this.__currentNestData.device[thermostat.serial_number].has_fan = thermostat.has_fan;
+                this.__currentNestData.device[thermostat.serial_number].can_cool = nestData.shared[thermostat.serial_number].can_cool;
+                this.__currentNestData.device[thermostat.serial_number].can_heat = nestData.shared[thermostat.serial_number].can_heat;
+                this.__currentNestData.device[thermostat.serial_number].description = nestData.shared[thermostat.serial_number].hasOwnProperty("name") ? nestData.shared[thermostat.serial_number].name : "";
+                this.__currentNestData.device[thermostat.serial_number].target_temperature_type = nestData.shared[thermostat.serial_number].target_temperature_type;
+                this.__currentNestData.device[thermostat.serial_number].target_temperature = __adjustTemperature(nestData.shared[thermostat.serial_number].target_temperature, "C", "C");
+                this.__currentNestData.device[thermostat.serial_number].target_temperature_high = __adjustTemperature(nestData.shared[thermostat.serial_number].target_temperature_high, "C", "C");
+                this.__currentNestData.device[thermostat.serial_number].target_temperature_low = __adjustTemperature(nestData.shared[thermostat.serial_number].target_temperature_low, "C", "C");
+                this.__currentNestData.device[thermostat.serial_number].backplate_temperature = __adjustTemperature(thermostat.backplate_temperature, "C", "C");
+                this.__currentNestData.device[thermostat.serial_number].hvac_mode = nestData.shared[thermostat.serial_number].target_temperature_type;
             
-            this.__currentNestData.device[thermostat.serial_number].battery_charging_state = typeof this.__previousNestData.device == "object" && thermostat.battery_level > this.__previousNestData.device[thermostat.serial_number].battery_level && this.__previousNestData.device[thermostat.serial_number].battery_level != 0 ? true : false;
-            this.__currentNestData.device[thermostat.serial_number].away = nestData.structure[nestData.link[thermostat.serial_number].structure.split('.')[1]].away;    // away status
-            this.__currentNestData.device[thermostat.serial_number].home_name = nestData.structure[nestData.link[thermostat.serial_number].structure.split('.')[1]].name;  // Home name
-            this.__currentNestData.device[thermostat.serial_number].orgNestStructureID = nestData.link[thermostat.serial_number].structure.split('.')[1]; // structure ID
+                // Work out current state ie" heating, cooling etc
+                if (nestData.shared[thermostat.serial_number].hvac_heater_state == true || nestData.shared[thermostat.serial_number].hvac_heat_x2_state == true || 
+                    nestData.shared[thermostat.serial_number].hvac_heat_x3_state == true || nestData.shared[thermostat.serial_number].hvac_aux_heater_state == true || 
+                    nestData.shared[thermostat.serial_number].hvac_alt_heat_x2_state == true || nestData.shared[thermostat.serial_number].hvac_emer_heat_state == true ||
+                    nestData.shared[thermostat.serial_number].hvac_alt_heat_state == true) {
+                    
+                    // A heating source is on, so we're in heating mode
+                    this.__currentNestData.device[thermostat.serial_number].hvac_state = "heating";
+                }
+                if (nestData.shared[thermostat.serial_number].hvac_ac_state == true || nestData.shared[thermostat.serial_number].hvac_cool_x2_state == true || nestData.shared[thermostat.serial_number].hvac_cool_x3_state == true) {
+                    
+                    // A cooling source is on, so we're in cooling mode
+                    this.__currentNestData.device[thermostat.serial_number].hvac_state = "cooling";
+                }
+                if (nestData.shared[thermostat.serial_number].hvac_heater_state == false && nestData.shared[thermostat.serial_number].hvac_heat_x2_state == false && 
+                    nestData.shared[thermostat.serial_number].hvac_heat_x3_state == false && nestData.shared[thermostat.serial_number].hvac_aux_heater_state == false && 
+                    nestData.shared[thermostat.serial_number].hvac_alt_heat_x2_state == false && nestData.shared[thermostat.serial_number].hvac_emer_heat_state == false &&
+                    nestData.shared[thermostat.serial_number].hvac_alt_heat_state == false && nestData.shared[thermostat.serial_number].hvac_ac_state == false &&
+                    nestData.shared[thermostat.serial_number].hvac_cool_x2_state == false && nestData.shared[thermostat.serial_number].hvac_cool_x3_state == false) {
+                    
+                    // No heating or cooling sources are on, so we're in off mode
+                    this.__currentNestData.device[thermostat.serial_number].hvac_state = "off";
+                }
+                if (nestData.shared[thermostat.serial_number].hvac_fan_state == true) {
+                    this.__currentNestData.device[thermostat.serial_number].hvac_state = "fan";
+                }
 
-            // Link in any temperature sensors
-            this.__currentNestData.device[thermostat.serial_number].active_rcs_sensor = (nestData.rcs_settings[thermostat.serial_number].active_rcs_sensors.length == 0 ? "" : nestData.kryptonite[nestData.rcs_settings[thermostat.serial_number].active_rcs_sensors[0].split('.')[1]].serial_number);
-            this.__currentNestData.device[thermostat.serial_number].active_temperature = (nestData.rcs_settings[thermostat.serial_number].active_rcs_sensors.length == 0 ? __adjustTemperature(thermostat.backplate_temperature, "C", "C") : __adjustTemperature(nestData.kryptonite[nestData.rcs_settings[thermostat.serial_number].active_rcs_sensors[0].split('.')[1]].current_temperature, "C", "C"));
-            this.__currentNestData.device[thermostat.serial_number].linked_rcs_sensors = [];
-            nestData.rcs_settings[thermostat.serial_number].associated_rcs_sensors.forEach(sensor => {
-                this.__currentNestData.device[thermostat.serial_number].linked_rcs_sensors.push(nestData.kryptonite[sensor.split('.')[1]].serial_number);
-            });
+                // Setup previous modes and states
+                if (typeof this.__previousNestData.device[thermostat.serial_number] != "object") {
+                    this.__previousNestData.device[thermostat.serial_number] = {};
+                    this.__previousNestData.device[thermostat.serial_number].hvac_mode = this.__currentNestData.device[thermostat.serial_number].hvac_mode;
+                    this.__previousNestData.device[thermostat.serial_number].hvac_state = this.__currentNestData.device[thermostat.serial_number].hvac_state;
+                    this.__previousNestData.device[thermostat.serial_number].previous_hvac_mode = this.__currentNestData.device[thermostat.serial_number].hvac_mode;
+                    this.__previousNestData.device[thermostat.serial_number].previous_hvac_state = this.__currentNestData.device[thermostat.serial_number].hvac_state;
+                    this.__previousNestData.device[thermostat.serial_number].battery_level = 0;
+                    this.__currentNestData.device[thermostat.serial_number].previous_hvac_mode = this.__currentNestData.device[thermostat.serial_number].hvac_mode;
+                    this.__currentNestData.device[thermostat.serial_number].previous_hvac_state = this.__currentNestData.device[thermostat.serial_number].hvac_state;
+                }
+
+                if (this.__currentNestData.device[thermostat.serial_number].hvac_mode != this.__previousNestData.device[thermostat.serial_number].hvac_mode) {
+                    this.__currentNestData.device[thermostat.serial_number].previous_hvac_mode = this.__previousNestData.device[thermostat.serial_number].hvac_mode;
+                } else {
+                    this.__currentNestData.device[thermostat.serial_number].previous_hvac_mode = this.__previousNestData.device[thermostat.serial_number].previous_hvac_mode;
+                }
+                if (this.__currentNestData.device[thermostat.serial_number].hvac_state != this.__previousNestData.device[thermostat.serial_number].hvac_state) {
+                    this.__currentNestData.device[thermostat.serial_number].previous_hvac_state = this.__previousNestData.device[thermostat.serial_number].hvac_state;
+                } else {
+                    this.__currentNestData.device[thermostat.serial_number].previous_hvac_state = this.__previousNestData.device[thermostat.serial_number].previous_hvac_state;
+                }
+
+                // Get device location name
+                this.__currentNestData.device[thermostat.serial_number].location = "";
+                nestData.where[nestData.link[thermostat.serial_number].structure.split('.')[1]].wheres.forEach(where => {
+                    if (thermostat.where_id == where.where_id) {
+                        this.__currentNestData.device[thermostat.serial_number].location = where.name;
+                    }
+                });
+                
+                this.__currentNestData.device[thermostat.serial_number].battery_charging_state = typeof this.__previousNestData.device == "object" && thermostat.battery_level > this.__previousNestData.device[thermostat.serial_number].battery_level && this.__previousNestData.device[thermostat.serial_number].battery_level != 0 ? true : false;
+                this.__currentNestData.device[thermostat.serial_number].away = nestData.structure[nestData.link[thermostat.serial_number].structure.split('.')[1]].away;    // away status
+                this.__currentNestData.device[thermostat.serial_number].home_name = nestData.structure[nestData.link[thermostat.serial_number].structure.split('.')[1]].name;  // Home name
+                this.__currentNestData.device[thermostat.serial_number].orgNestStructureID = nestData.link[thermostat.serial_number].structure.split('.')[1]; // structure ID
+
+                // Link in any temperature sensors, checking to ensure any aren't excluded
+                this.__currentNestData.device[thermostat.serial_number].active_rcs_sensor = "";
+                this.__currentNestData.device[thermostat.serial_number].active_temperature = __adjustTemperature(thermostat.backplate_temperature, "C", "C");
+                this.__currentNestData.device[thermostat.serial_number].linked_rcs_sensors = [];
+                nestData.rcs_settings[thermostat.serial_number].associated_rcs_sensors.forEach(sensor => {
+                    var sensorInfo = nestData.kryptonite[sensor.split('.')[1]];
+                    if (this.__excludedDevices.includes(sensorInfo.serial_number.toUpperCase()) == false) {
+                        // Associated temperature sensor isn't excluded
+                        this.__currentNestData.device[thermostat.serial_number].linked_rcs_sensors.push(sensorInfo.serial_number.toUpperCase());
+
+                        // Is this sensor teh active one. If so, get some details about it
+                        if (nestData.rcs_settings[thermostat.serial_number].active_rcs_sensors.length > 0 && sensorInfo.serial_number.toUpperCase() == nestData.kryptonite[nestData.rcs_settings[thermostat.serial_number].active_rcs_sensors[0].split('.')[1]].serial_number.toUpperCase()) {
+                            this.__currentNestData.device[thermostat.serial_number].active_rcs_sensor = nestData.kryptonite[nestData.rcs_settings[thermostat.serial_number].active_rcs_sensors[0].split('.')[1]].serial_number.toUpperCase();
+                            this.__currentNestData.device[thermostat.serial_number].active_temperature =  __adjustTemperature(nestData.kryptonite[nestData.rcs_settings[thermostat.serial_number].active_rcs_sensors[0].split('.')[1]].current_temperature, "C", "C")
+                        }
+                    }
+                });
+
+
+                // Insert any extra options we've read in from configuration file
+                this.__extraOptions[thermostat.serial_number] && Object.entries(this.__extraOptions[thermostat.serial_number]).forEach(([key, value]) => {
+                    this.__currentNestData.device[thermostat.serial_number][key] = value;
+                });
+             }
         });
 
         nestData.kryptonite && Object.entries(nestData.kryptonite).forEach(([deviceID, sensor]) => {
-            this.__currentNestData.device[sensor.serial_number] = {}
-            this.__currentNestData.device[sensor.serial_number].device_type = "sensor";  // nest temperature sensor
-            this.__currentNestData.device[sensor.serial_number].orgNestStructure = "kryptonite." + deviceID;
-            this.__currentNestData.device[sensor.serial_number].serial_number = sensor.serial_number;
-            this.__currentNestData.device[sensor.serial_number].description = sensor.hasOwnProperty("description") ? sensor.description : ""; 
-            this.__currentNestData.device[sensor.serial_number].mac_address = "641666" + deviceID.substr(10,6); // Generate a CRC24 instead for mac last 6 digits
-            this.__currentNestData.device[sensor.serial_number].mac_address.toUpperCase();
-            this.__currentNestData.device[sensor.serial_number].current_temperature = sensor.current_temperature;
-            this.__currentNestData.device[sensor.serial_number].battery_level = sensor.battery_level;
-            this.__currentNestData.device[sensor.serial_number].battery_charging_state = false; // on battery, so doesn't charge
-            this.__currentNestData.device[sensor.serial_number].software_version = "1.0";
-            this.__currentNestData.device[sensor.serial_number].current_temperature = __adjustTemperature(sensor.current_temperature, "C", "C");
+            // Process temperature sensors
+            var tempMACAddress = "641666" + deviceID.substr(10,6).toUpperCase(); // TODO - Generate a CRC24 based off serial number instead for MAC last 6 digits
+            tempMACAddress = tempMACAddress.substr(0,2) + ":" + tempMACAddress.substr(2,2) + ":" + tempMACAddress.substr(4,2) + ":" + tempMACAddress.substr(6,2) + ":" + tempMACAddress.substr(8,2) + ":" + tempMACAddress.substr(10,2)
+            if (this.__excludedDevices.includes(sensor.serial_number.toUpperCase()) == false) {
+                // Device is not in excluded list, so include
+                this.__currentNestData.device[sensor.serial_number] = {}
+                this.__currentNestData.device[sensor.serial_number].device_type = "sensor";  // nest temperature sensor
+                this.__currentNestData.device[sensor.serial_number].orgNestStructure = "kryptonite." + deviceID;
+                this.__currentNestData.device[sensor.serial_number].serial_number = sensor.serial_number.toUpperCase();
+                this.__currentNestData.device[sensor.serial_number].description = sensor.hasOwnProperty("description") ? sensor.description : ""; 
+                this.__currentNestData.device[sensor.serial_number].mac_address = tempMACAddress;   // Our created MAC address
+                this.__currentNestData.device[sensor.serial_number].current_temperature = sensor.current_temperature;
+                this.__currentNestData.device[sensor.serial_number].battery_level = sensor.battery_level;
+                this.__currentNestData.device[sensor.serial_number].battery_charging_state = false; // on battery, so doesn't charge
+                this.__currentNestData.device[sensor.serial_number].software_version = "1.0";
+                this.__currentNestData.device[sensor.serial_number].current_temperature = __adjustTemperature(sensor.current_temperature, "C", "C");
 
-            // Get device location name
-            this.__currentNestData.device[sensor.serial_number].location = "";
-            nestData.where[sensor.structure_id].wheres.forEach(where => {
-                if (sensor.where_id == where.where_id) {
-                    this.__currentNestData.device[sensor.serial_number].location = where.name;
-                }
-            });
+                // Get device location name
+                this.__currentNestData.device[sensor.serial_number].location = "";
+                nestData.where[sensor.structure_id].wheres.forEach(where => {
+                    if (sensor.where_id == where.where_id) {
+                        this.__currentNestData.device[sensor.serial_number].location = where.name;
+                    }
+                });
 
-            this.__currentNestData.device[sensor.serial_number].online = (Math.floor(new Date() / 1000) - sensor.last_updated_at) < (3600 * 3) ? true : false;    // online status. allow upto 3hrs for reporting before report sensor offline
-            this.__currentNestData.device[sensor.serial_number].home_name = nestData.structure[sensor.structure_id].name;    // Home name
-            this.__currentNestData.device[sensor.serial_number].orgNestStructureID = sensor.structure_id; // structure ID
+                this.__currentNestData.device[sensor.serial_number].online = (Math.floor(new Date() / 1000) - sensor.last_updated_at) < (3600 * 3) ? true : false;    // online status. allow upto 3hrs for reporting before report sensor offline
+                this.__currentNestData.device[sensor.serial_number].home_name = nestData.structure[sensor.structure_id].name;    // Home name
+                this.__currentNestData.device[sensor.serial_number].orgNestStructureID = sensor.structure_id; // structure ID
+
+                // Insert any extra options we've read in from configuration file for this device
+                this.__extraOptions[sensor.serial_number] && Object.entries(this.__extraOptions[sensor.serial_number]).forEach(([key, value]) => {
+                    this.__currentNestData.device[sensor.serial_number][key] = value;
+                });
+            }
         });
 
         nestData.topaz && Object.entries(nestData.topaz).forEach(([deviceID, protect]) => {
-            if (typeof this.__previousNestData.device[protect.serial_number] != "object") {
-                this.__previousNestData.device[protect.serial_number] = {};
-                this.__previousNestData.device[protect.serial_number].battery_level = 0;
-            }
-
-            // process smoke detectors
-            this.__currentNestData.device[protect.serial_number] = {};
-            this.__currentNestData.device[protect.serial_number].device_type = "protect";  // nest protect
-            this.__currentNestData.device[protect.serial_number].orgNestStructure = "topaz." + deviceID;
-            this.__currentNestData.device[protect.serial_number].serial_number = protect.serial_number;
-            this.__currentNestData.device[protect.serial_number].line_power_present = protect.line_power_present;
-            this.__currentNestData.device[protect.serial_number].wired_or_battery = protect.wired_or_battery;
-            this.__currentNestData.device[protect.serial_number].battery_level = protect.battery_level;
-            this.__currentNestData.device[protect.serial_number].battery_health_state = protect.battery_health_state;
-            this.__currentNestData.device[protect.serial_number].smoke_status = protect.smoke_status;
-            this.__currentNestData.device[protect.serial_number].co_status = protect.co_status;
-            this.__currentNestData.device[protect.serial_number].replacement_date = protect.replace_by_date_utc_secs;
-            this.__currentNestData.device[protect.serial_number].co_previous_peak = protect.co_previous_peak;
-            this.__currentNestData.device[protect.serial_number].mac_address = protect.wifi_mac_address.toUpperCase();
-            this.__currentNestData.device[protect.serial_number].online = nestData.widget_track[protect.thread_mac_address.toUpperCase()].online;
-            this.__currentNestData.device[protect.serial_number].description = protect.hasOwnProperty("description") ? protect.description : "";
-            this.__currentNestData.device[protect.serial_number].software_version = protect.software_version.replace(/-/g, ".");    // fix software version for HomeKit
-            this.__currentNestData.device[protect.serial_number].ui_color_state = "grey";
-            if (protect.battery_health_state == 0 && protect.co_status == 0 && protect.smoke_status == 0) this.__currentNestData.device[protect.serial_number].ui_color_state = "green";
-            if (protect.battery_health_state != 0 || protect.co_status == 1 || protect.smoke_status == 1) this.__currentNestData.device[protect.serial_number].ui_color_state = "yellow";
-            if (protect.co_status == 2 || protect.smoke_status == 2) this.__currentNestData.device[protect.serial_number].ui_color_state = "red";
-        
-            // Get device location name
-            this.__currentNestData.device[protect.serial_number].location = "";
-            nestData.where[protect.structure_id].wheres.forEach(where => {
-                if (protect.where_id == where.where_id) {
-                    this.__currentNestData.device[protect.serial_number].location = where.name;
+            // Process smoke detectors
+            var tempMACAddress = protect.wifi_mac_address.toUpperCase();
+            tempMACAddress = tempMACAddress.substr(0,2) + ":" + tempMACAddress.substr(2,2) + ":" + tempMACAddress.substr(4,2) + ":" + tempMACAddress.substr(6,2) + ":" + tempMACAddress.substr(8,2) + ":" + tempMACAddress.substr(10,2)
+            if (this.__excludedDevices.includes(protect.serial_number.toUpperCase()) == false) {
+                // Device is not in excluded list, so include
+                if (typeof this.__previousNestData.device[protect.serial_number] != "object") {
+                    this.__previousNestData.device[protect.serial_number] = {};
+                    this.__previousNestData.device[protect.serial_number].battery_level = 0;
                 }
-            });
-            this.__currentNestData.device[protect.serial_number].battery_charging_state = typeof this.__previousNestData.device == "object" && protect.battery_level > this.__previousNestData.device[protect.serial_number].battery_level && this.__previousNestData.device[protect.serial_number].battery_level != 0 ? true : false;
-            this.__currentNestData.device[protect.serial_number].away = protect.auto_away;   // away status
-            this.__currentNestData.device[protect.serial_number].home_name = nestData.structure[protect.structure_id].name;  // Home name
-            this.__currentNestData.device[protect.serial_number].orgNestStructureID = protect.structure_id; // structure ID
+
+                this.__currentNestData.device[protect.serial_number] = {};
+                this.__currentNestData.device[protect.serial_number].device_type = "protect";  // nest protect
+                this.__currentNestData.device[protect.serial_number].orgNestStructure = "topaz." + deviceID;
+                this.__currentNestData.device[protect.serial_number].serial_number = protect.serial_number.toUpperCase();
+                this.__currentNestData.device[protect.serial_number].line_power_present = protect.line_power_present;
+                this.__currentNestData.device[protect.serial_number].wired_or_battery = protect.wired_or_battery;
+                this.__currentNestData.device[protect.serial_number].battery_level = protect.battery_level;
+                this.__currentNestData.device[protect.serial_number].battery_health_state = protect.battery_health_state;
+                this.__currentNestData.device[protect.serial_number].smoke_status = protect.smoke_status;
+                this.__currentNestData.device[protect.serial_number].co_status = protect.co_status;
+                this.__currentNestData.device[protect.serial_number].replacement_date = protect.replace_by_date_utc_secs;
+                this.__currentNestData.device[protect.serial_number].co_previous_peak = protect.co_previous_peak;
+                this.__currentNestData.device[protect.serial_number].mac_address = tempMACAddress;  // Our created MAC address
+                this.__currentNestData.device[protect.serial_number].online = nestData.widget_track[protect.thread_mac_address.toUpperCase()].online;
+                this.__currentNestData.device[protect.serial_number].description = protect.hasOwnProperty("description") ? protect.description : "";
+                this.__currentNestData.device[protect.serial_number].software_version = protect.software_version.replace(/-/g, ".");    // fix software version for HomeKit
+                this.__currentNestData.device[protect.serial_number].ui_color_state = "grey";
+                if (protect.battery_health_state == 0 && protect.co_status == 0 && protect.smoke_status == 0) this.__currentNestData.device[protect.serial_number].ui_color_state = "green";
+                if (protect.battery_health_state != 0 || protect.co_status == 1 || protect.smoke_status == 1) this.__currentNestData.device[protect.serial_number].ui_color_state = "yellow";
+                if (protect.co_status == 2 || protect.smoke_status == 2) this.__currentNestData.device[protect.serial_number].ui_color_state = "red";
+            
+                // Get device location name
+                this.__currentNestData.device[protect.serial_number].location = "";
+                nestData.where[protect.structure_id].wheres.forEach(where => {
+                    if (protect.where_id == where.where_id) {
+                        this.__currentNestData.device[protect.serial_number].location = where.name;
+                    }
+                });
+                this.__currentNestData.device[protect.serial_number].battery_charging_state = typeof this.__previousNestData.device == "object" && protect.battery_level > this.__previousNestData.device[protect.serial_number].battery_level && this.__previousNestData.device[protect.serial_number].battery_level != 0 ? true : false;
+                this.__currentNestData.device[protect.serial_number].away = protect.auto_away;   // away status
+                this.__currentNestData.device[protect.serial_number].home_name = nestData.structure[protect.structure_id].name;  // Home name
+                this.__currentNestData.device[protect.serial_number].orgNestStructureID = protect.structure_id; // structure ID
+
+                // Insert any extra options we've read in from configuration file for this device
+                this.__extraOptions[protect.serial_number] && Object.entries(this.__extraOptions[protect.serial_number]).forEach(([key, value]) => {
+                    this.__currentNestData.device[protect.serial_number][key] = value;
+                });
+            }
         });
 
         // get full camera details from the nest structure and seperate API
         nestData.quartz && Object.entries(nestData.quartz).forEach(([deviceID, camera]) => {
-            if (typeof this.__previousNestData.device[camera.serial_number] != "object") {
-                this.__previousNestData.device[camera.serial_number] = {};
-                this.__previousNestData.device[camera.serial_number].battery_level = 0;
-                this.__previousNestData.device[camera.serial_number].current_alert = [];
-                this.__previousNestData.device[camera.serial_number].activity_zones = [];
-            }
-            
             // Process cameras
-            this.__currentNestData.device[camera.serial_number] = {};
-            this.__currentNestData.device[camera.serial_number].device_type = camera.camera_type == 12 ? "doorbell" : "camera";  // nest doorbell or camera
-            this.__currentNestData.device[camera.serial_number].orgNestStructure = "quartz." + deviceID;
-            this.__currentNestData.device[camera.serial_number].serial_number = camera.serial_number;
-            this.__currentNestData.device[camera.serial_number].software_version = camera.software_version.replace(/-/g, "."); // fix software version for HomeKit
-            this.__currentNestData.device[camera.serial_number].mac_address = camera.mac_address.toUpperCase();
-            this.__currentNestData.device[camera.serial_number].description = camera.hasOwnProperty("description") ? camera.description : "";
-            this.__currentNestData.device[camera.serial_number].camera_uuid = deviceID;  // Can generate from .orgNestStructure anyway
-
-            this.__currentNestData.device[camera.serial_number].direct_nexustalk_host = camera.camera_get_details.direct_nexustalk_host;
-            //this.__currentNestData.device[camera.serial_number].direct_nexustalk_host = camera.direct_nexustalk_host;
- 
-            // process other details we added to the "quartz" camera structure 
-            this.__currentNestData.device[camera.serial_number].streaming_enabled = camera.camera_get_details.is_streaming_enabled;
-            this.__currentNestData.device[camera.serial_number].nexus_api_http_server_url = camera.camera_get_details.hasOwnProperty("nexus_api_http_server") ? camera.camera_get_details.nexus_api_http_server : camera.nexus_api_http_server_url;
-            this.__currentNestData.device[camera.serial_number].nexus_api_nest_domain_host = camera.camera_get_details.nexus_api_nest_domain_host;
-            this.__currentNestData.device[camera.serial_number].battery_level = camera.camera_get_details.rq_battery_battery_volt;
-            this.__currentNestData.device[camera.serial_number].battery_charging_state = typeof this.__previousNestData.device == "object" && camera.camera_get_details.rq_battery_battery_volt > this.__previousNestData.device[camera.serial_number].battery_level && this.__previousNestData.device[camera.serial_number].battery_level != 0 ? true : false;
-            this.__currentNestData.device[camera.serial_number].online = camera.camera_get_details.hasOwnProperty("is_online") ? camera.camera_get_details.is_online : true;
-            this.__currentNestData.device[camera.serial_number].capabilities = camera.camera_get_details.capabilities;
-            this.__currentNestData.device[camera.serial_number].properties = camera.camera_get_details.properties;
-
-            // process activity zones for camera
-            this.__currentNestData.device[camera.serial_number].activity_zones = [];
-            camera.camera_get_zones.forEach(zone => {
-                if (zone.type.toUpperCase() == "ACTIVITY" || zone.type.toUpperCase() == "REGION") this.__currentNestData.device[camera.serial_number].activity_zones.push({"id": zone.id, "name": zone.label})
-            });
-
-            // process alerts
-            this.__currentNestData.device[camera.serial_number].current_alert = [];
-            if (camera.camera_get_alerts.length >= 1) {
-                this.__currentNestData.device[camera.serial_number].current_alert.push(camera.camera_get_alerts[camera.camera_get_alerts.length - 1]); // Last event
-            }
-       
-            // Get device location name
-            this.__currentNestData.device[camera.serial_number].location = "";
-            nestData.where[camera.structure_id].wheres.forEach(where => {
-                if (camera.where_id == where.where_id) {
-                    this.__currentNestData.device[camera.serial_number].location = where.name;
+            var tempMACAddress = camera.mac_address.toUpperCase();
+            tempMACAddress = tempMACAddress.substr(0,2) + ":" + tempMACAddress.substr(2,2) + ":" + tempMACAddress.substr(4,2) + ":" + tempMACAddress.substr(6,2) + ":" + tempMACAddress.substr(8,2) + ":" + tempMACAddress.substr(10,2)
+            if (this.__excludedDevices.includes(camera.serial_number.toUpperCase()) == false) {
+                // Device is not in excluded list, so include
+                if (typeof this.__previousNestData.device[camera.serial_number] != "object") {
+                    this.__previousNestData.device[camera.serial_number] = {};
+                    this.__previousNestData.device[camera.serial_number].battery_level = 0;
+                    this.__previousNestData.device[camera.serial_number].current_alert = [];
+                    this.__previousNestData.device[camera.serial_number].activity_zones = [];
                 }
-            });
-            this.__currentNestData.device[camera.serial_number].home_name = nestData.structure[camera.structure_id].name;  // Home name
-            this.__currentNestData.device[camera.serial_number].orgNestStructureID = camera.structure_id; // structure ID
+                
+                this.__currentNestData.device[camera.serial_number] = {};
+                this.__currentNestData.device[camera.serial_number].device_type = camera.camera_type == 12 ? "doorbell" : "camera";  // nest doorbell or camera
+                this.__currentNestData.device[camera.serial_number].orgNestStructure = "quartz." + deviceID;
+                this.__currentNestData.device[camera.serial_number].serial_number = camera.serial_number.toUpperCase();
+                this.__currentNestData.device[camera.serial_number].software_version = camera.software_version.replace(/-/g, "."); // fix software version for HomeKit
+                this.__currentNestData.device[camera.serial_number].mac_address = tempMACAddress;  // Our created MAC address;
+                this.__currentNestData.device[camera.serial_number].description = camera.hasOwnProperty("description") ? camera.description : "";
+                this.__currentNestData.device[camera.serial_number].camera_uuid = deviceID;  // Can generate from .orgNestStructure anyway
+
+                this.__currentNestData.device[camera.serial_number].direct_nexustalk_host = camera.camera_get_details.direct_nexustalk_host;
+                //this.__currentNestData.device[camera.serial_number].direct_nexustalk_host = camera.direct_nexustalk_host;
+    
+                // process other details we added to the "quartz" camera structure 
+                this.__currentNestData.device[camera.serial_number].streaming_enabled = camera.camera_get_details.is_streaming_enabled;
+                this.__currentNestData.device[camera.serial_number].nexus_api_http_server_url = camera.camera_get_details.hasOwnProperty("nexus_api_http_server") ? camera.camera_get_details.nexus_api_http_server : camera.nexus_api_http_server_url;
+                this.__currentNestData.device[camera.serial_number].nexus_api_nest_domain_host = camera.camera_get_details.nexus_api_nest_domain_host;
+                this.__currentNestData.device[camera.serial_number].battery_level = camera.camera_get_details.rq_battery_battery_volt;
+                this.__currentNestData.device[camera.serial_number].battery_charging_state = typeof this.__previousNestData.device == "object" && camera.camera_get_details.rq_battery_battery_volt > this.__previousNestData.device[camera.serial_number].battery_level && this.__previousNestData.device[camera.serial_number].battery_level != 0 ? true : false;
+                this.__currentNestData.device[camera.serial_number].online = camera.camera_get_details.hasOwnProperty("is_online") ? camera.camera_get_details.is_online : true;
+                this.__currentNestData.device[camera.serial_number].capabilities = camera.camera_get_details.capabilities;
+                this.__currentNestData.device[camera.serial_number].properties = camera.camera_get_details.properties;
+
+                // process activity zones for camera
+                this.__currentNestData.device[camera.serial_number].activity_zones = [];
+                camera.camera_get_zones.forEach(zone => {
+                    if (zone.type.toUpperCase() == "ACTIVITY" || zone.type.toUpperCase() == "REGION") this.__currentNestData.device[camera.serial_number].activity_zones.push({"id": zone.id, "name": zone.label})
+                });
+
+                // process alerts
+                this.__currentNestData.device[camera.serial_number].current_alert = [];
+                if (camera.camera_get_alerts.length >= 1) {
+                    this.__currentNestData.device[camera.serial_number].current_alert.push(camera.camera_get_alerts[camera.camera_get_alerts.length - 1]); // Last event
+                }
+        
+                // Get device location name
+                this.__currentNestData.device[camera.serial_number].location = "";
+                nestData.where[camera.structure_id].wheres.forEach(where => {
+                    if (camera.where_id == where.where_id) {
+                        this.__currentNestData.device[camera.serial_number].location = where.name;
+                    }
+                });
+                this.__currentNestData.device[camera.serial_number].home_name = nestData.structure[camera.structure_id].name;  // Home name
+                this.__currentNestData.device[camera.serial_number].orgNestStructureID = camera.structure_id; // structure ID
+
+                // Insert any extra options we've read in from configuration file for this device
+                this.__extraOptions[camera.serial_number] && Object.entries(this.__extraOptions[camera.serial_number]).forEach(([key, value]) => {
+                    this.__currentNestData.device[camera.serial_number][key] = value;
+                });
+            }
         });
     }
 }
@@ -1395,6 +1529,13 @@ NestClass.prototype.__getCameraDetails = async function(cameraURL, cameraUUID) {
             cameraDetails.details = details.data.items[0];
             cameraDetails.activity_zones = zones.data;
             cameraDetails.alerts = alerts.data;
+
+            // Fix up alert zone id's. Appears if no Nest Aware subscription, the zone_id in the associated alert is left blank. We'll assign the alert zone to '0' in this case
+            cameraDetails.alerts.forEach(alert => {
+                if (alert.zone_ids.length == 0) {
+                    alert.zone_ids = [0];   // Default zone ID ie: main zone
+                }
+            });
         }
     }.bind(this)))
     .catch(error => {
@@ -1426,48 +1567,64 @@ NestClass.prototype.__interalTimer = async function() {
     // Build object for subscription, based upon subscribed device types
     var subscribeData = {objects: []};
     var cameraPolling = [];
-    this.__lastNestData && Object.entries(this.__lastNestData).forEach(([mainKey]) => {
-        // shared, track, device, structure, where, rcs_settings, kryptonite, topaz, widget_track, link, quartz
-        Object.entries(this.__lastNestData[mainKey]).forEach(([subKey]) => {
-            // See if this key relates to a subscribed device (device, topaz, kryptonite, quartz)
-            if (mainKey == "device" || mainKey == "kryptonite" || mainKey == "topaz" || mainKey == "quartz" || mainKey == "shared" || mainKey == "track" || mainKey == "rcs_settings" || mainKey == "widget_track" || mainKey == "link") {
-                if (this.__subscribed.findIndex( ({ nestID }) => nestID && nestID.split('.')[1] === subKey) != -1 ) {
-                    subscribeData.objects.push({"object_key" :  mainKey + "." + subKey, "object_revision" : this.__lastNestData[mainKey][subKey]["$version"], "object_timestamp": this.__lastNestData[mainKey][subKey]["$timestamp"]});
-                }
+
+    this.__currentNestData.device && Object.entries(this.__currentNestData.device).forEach(([deviceID]) => {
+        var mainKey = this.__currentNestData.device[deviceID].orgNestStructure.split('.')[0];
+        var subKey = this.__currentNestData.device[deviceID].orgNestStructure.split('.')[1];
+        var structure = this.__currentNestData.device[deviceID].orgNestStructureID;
+        if (this.__subscribed.findIndex( ({ device }) => device === deviceID) != -1 ) {
+            if (this.__currentNestData.device[deviceID].device_type == "thermostat") {
+                // for thermostats, we need to subscribe to device, shared, track, link, rcs_settings
+                subscribeData.objects.push({"object_key" :  "device." + subKey, "object_revision" : this.__lastNestData["device"][subKey]["$version"], "object_timestamp": this.__lastNestData["device"][subKey]["$timestamp"]});
+                subscribeData.objects.push({"object_key" :  "shared." + subKey, "object_revision" : this.__lastNestData["shared"][subKey]["$version"], "object_timestamp": this.__lastNestData["shared"][subKey]["$timestamp"]});
+                subscribeData.objects.push({"object_key" :  "track." + subKey, "object_revision" : this.__lastNestData["track"][subKey]["$version"], "object_timestamp": this.__lastNestData["track"][subKey]["$timestamp"]});
+                subscribeData.objects.push({"object_key" :  "link." + subKey, "object_revision" : this.__lastNestData["link"][subKey]["$version"], "object_timestamp": this.__lastNestData["link"][subKey]["$timestamp"]});
+                subscribeData.objects.push({"object_key" :  "rcs_settings." + subKey, "object_revision" : this.__lastNestData["rcs_settings"][subKey]["$version"], "object_timestamp": this.__lastNestData["rcs_settings"][subKey]["$timestamp"]});
             }
-            if (mainKey == "structure" || mainKey == "where") {
-                // Always subscribe to structure and where object changes
-                subscribeData.objects.push({"object_key" :  mainKey + "." + subKey, "object_revision" : this.__lastNestData[mainKey][subKey]["$version"], "object_timestamp": this.__lastNestData[mainKey][subKey]["$timestamp"]});
+            if (this.__currentNestData.device[deviceID].device_type == "sensor") {
+                // for sensors, we need to subscribe to kryptonite
+                subscribeData.objects.push({"object_key" :  "kryptonite." + subKey, "object_revision" : this.__lastNestData["kryptonite"][subKey]["$version"], "object_timestamp": this.__lastNestData["kryptonite"][subKey]["$timestamp"]});
             }
-        });
+            if (this.__currentNestData.device[deviceID].device_type == "protect") {
+                // for sensors, we need to subscribe to topaz, widget_track
+                subscribeData.objects.push({"object_key" :  "topaz." + subKey, "object_revision" : this.__lastNestData["topaz"][subKey]["$version"], "object_timestamp": this.__lastNestData["topaz"][subKey]["$timestamp"]});
+                subscribeData.objects.push({"object_key" :  "widget_track." + subKey, "object_revision" : this.__lastNestData["widget_track"][subKey]["$version"], "object_timestamp": this.__lastNestData["widget_track"][subKey]["$timestamp"]});
+            }
+            if (this.__currentNestData.device[deviceID].device_type == "doorbell" || this.__currentNestData.device[deviceID].device_type == "camera") {
+                // for doorbells/cameras, we need to subscribe to quartz
+                subscribeData.objects.push({"object_key" :  "quartz." + subKey, "object_revision" : this.__lastNestData["quartz"][subKey]["$version"], "object_timestamp": this.__lastNestData["quartz"][subKey]["$timestamp"]});
+
+                // Additonaly, seperate process for camera(s) to get changes to alerts etc as these don't appear in the normal Nest structure
+                // TODO - find a subscribe endpoint???? protentially firebase cloud messaging is used??
+                var tempTimer = setInterval(async function() {
+                    var cameraDetails = await this.__getCameraDetails(this.__currentNestData.device[deviceID].nexus_api_http_server_url, this.__currentNestData.device[deviceID].camera_uuid);
+                    if (cameraDetails != null) {
+                        this.__lastNestData[mainKey][subKey].camera_get_details = cameraDetails.details;
+                        this.__lastNestData[mainKey][subKey].camera_get_zones = cameraDetails.activity_zones
+                        this.__lastNestData[mainKey][subKey].camera_get_alerts = cameraDetails.alerts;
+                    }
+        
+                    // Process updated device data for this doorbell/camera
+                    await this.__processNestData(this.__lastNestData);
+                    
+                    // Process subscribed callbacks
+                    if (this.__deviceChanged(this.__currentNestData.device[deviceID].serial_number)) {
+                        var subscribeIndex = this.__subscribed.findIndex( ({ device }) => device === this.__currentNestData.device[deviceID].serial_number);
+                        if (subscribeIndex != -1) {       
+                            this.__subscribed[subscribeIndex].callback(this.__subscribed[subscribeIndex].accessory, this.__currentNestData.device[this.__subscribed[subscribeIndex].device]);
+                        }
+                    }
+                }.bind(this), 2000);    // Every 2 seconds
+                cameraPolling.push(tempTimer);  // push onto camera polling timer list
+            }
+        }
+
+        // Always subscribe to structure and where
+        if (this.__subscribed.findIndex( ({ object_key }) => object_key === "structure." + structure) == -1 ) subscribeData.objects.push({"object_key" :  "structure." + structure, "object_revision" : this.__lastNestData["structure"][structure]["$version"], "object_timestamp": this.__lastNestData["structure"][structure]["$timestamp"]});
+        if (this.__subscribed.findIndex( ({ object_key }) => object_key === "where." + structure) == -1 ) subscribeData.objects.push({"object_key" :  "where." + structure, "object_revision" : this.__lastNestData["where"][structure]["$version"], "object_timestamp": this.__lastNestData["where"][structure]["$timestamp"]});
     });
 
-    // seperate process for camera(s) to get changes as these don't appear in the normal Nest structure
-    // TODO - find a subscribe endpoint???? protentially firebase cloud messaging is used??
-    this.__lastNestData.quartz && Object.entries(this.__lastNestData.quartz).forEach(([deviceID, camera]) => {
-        var tempTimer = setInterval(async function() {
-            var cameraDetails = await this.__getCameraDetails(camera.nexus_api_http_server_url, deviceID);
-            if (cameraDetails != null) {
-                this.__lastNestData.quartz[deviceID].camera_get_details = cameraDetails.details;
-                this.__lastNestData.quartz[deviceID].camera_get_zones = cameraDetails.activity_zones
-                this.__lastNestData.quartz[deviceID].camera_get_alerts = cameraDetails.alerts;
-            }
-
-            // Process updated device data
-            await this.__processNestData(this.__lastNestData, deviceID);
-            
-            // Process subscribed callbacks
-            if (this.__deviceChanged(camera.serial_number)) {
-                var subscribeIndex = this.__subscribed.findIndex( ({ device }) => device === camera.serial_number);
-                if (subscribeIndex != -1) {       
-                    this.__subscribed[subscribeIndex].callback(this.__subscribed[subscribeIndex].accessory, this.__currentNestData.device[this.__subscribed[subscribeIndex].device]);
-                }
-            }
-        }.bind(this), 2000);    // Every 2 seconds
-        cameraPolling.push({"timer" : tempTimer});  // push onto camera polling timer list
-    });
-
-    // Do subscription for the data we need from the Nest structure.. Timeout after 2mins of no data received, and if timed-out, rinse and repeat :-) 
+    // Do subscription for the data we need from the Nest structure.. Timeout after 2mins if no data received, and if timed-out, rinse and repeat :-) 
     var tempDeviceList = [];
     axios({
         method: "post",
@@ -1560,7 +1717,7 @@ NestClass.prototype.__interalTimer = async function() {
                 // Subscription failed with a 404 error "not found", so this could indicate devices have change. we'll check here also
                 await this.getNestData(true);  // get current data and process
 
-                // compare current vs previous devices to see if things added and/or removed
+                // compare current vs previous devices to see if things have been added and/or removed
                 var oldDeviceList = Object.entries(this.__previousNestData.device).toString().split(',').map(String);
                 var newDeviceList = Object.entries(this.__currentNestData.device).toString().split(',').map(String);
                 for (var index in oldDeviceList) {
@@ -1606,9 +1763,9 @@ NestClass.prototype.__interalTimer = async function() {
         }
     })
     .finally(() => {
-        // Clear any camerapolling timers
+        // Clear any camera polling timers
         cameraPolling.forEach(timer => {
-            clearInterval(timer.timer); // clear the timer to stop polling 
+            clearInterval(timer); // clear the timer to stop polling 
         });
         // subscribe again after small delay :-)
         setTimeout(this.__interalTimer.bind(this), 500);
@@ -1647,10 +1804,6 @@ function __adjustTemperature(temp_in, unit_in, unit_out) {
 }
 
 function processDeviceforHomeKit(nestObject, nestDevice, action) {
-    //var tempMACAddress = "555555" + nestDevice.mac_address.substr(6,6);
-    //tempMACAddress = tempMACAddress.substr(0,2) + ":" + tempMACAddress.substr(2,2) + ":" + tempMACAddress.substr(4,2) + ":" + tempMACAddress.substr(6,2) + ":" + tempMACAddress.substr(8,2) + ":" + tempMACAddress.substr(10,2);
-
-    var tempMACAddress = nestDevice.mac_address.substr(0,2) + ":" + nestDevice.mac_address.substr(2,2) + ":" + nestDevice.mac_address.substr(4,2) + ":" + nestDevice.mac_address.substr(6,2) + ":" + nestDevice.mac_address.substr(8,2) + ":" + nestDevice.mac_address.substr(10,2);
     if (action == true && typeof nestDevice == "object") {
         // adding device into HomeKit
         // Generate some common things
@@ -1668,7 +1821,7 @@ function processDeviceforHomeKit(nestObject, nestDevice, action) {
 
                 // Create accessory for each discovered nest
                 var tempAccessory = exports.accessory = new Accessory("Nest Thermostat", uuid.generate("hap-nodejs:accessories:nest_" + nestDevice.serial_number));
-                tempAccessory.username = tempMACAddress;
+                tempAccessory.username = nestDevice.mac_address;
                 tempAccessory.pincode = AccessoryPincode;
                 tempAccessory.category = Accessory.Categories.THERMOSTAT;  // Thermostat type accessory
                 tempAccessory.getService(Service.AccessoryInformation).setCharacteristic(Characteristic.Manufacturer, "Nest");
@@ -1694,7 +1847,7 @@ function processDeviceforHomeKit(nestObject, nestDevice, action) {
                 //if (nestDevice.serial_number.substr(0,2) == "22") tempModel = tempModel + " 1st Gen";  // Nest Temperature Sensor 1st Gen
 
                 var tempAccessory = exports.accessory = new Accessory("Nest Temperature Sensor", uuid.generate("hap-nodejs:accessories:nest_" + nestDevice.serial_number));
-                tempAccessory.username = tempMACAddress;
+                tempAccessory.username = nestDevice.mac_address;
                 tempAccessory.pincode = AccessoryPincode;
                 tempAccessory.category = Accessory.Categories.SENSOR;  // Sensor type accessory
                 tempAccessory.getService(Service.AccessoryInformation).setCharacteristic(Characteristic.Manufacturer, "Nest");
@@ -1722,7 +1875,7 @@ function processDeviceforHomeKit(nestObject, nestDevice, action) {
                 if (nestDevice.wired_or_battery == 1) tempModel = tempModel + " (Battery)";    // Battery powered
 
                 var tempAccessory = exports.accessory = new Accessory("Nest Protect", uuid.generate("hap-nodejs:accessories:nest_" + nestDevice.serial_number));
-                tempAccessory.username = tempMACAddress;
+                tempAccessory.username = nestDevice.mac_address;
                 tempAccessory.pincode = AccessoryPincode;
                 tempAccessory.category = Accessory.Categories.SENSOR;  // Sensor type accessory
                 tempAccessory.getService(Service.AccessoryInformation).setCharacteristic(Characteristic.Manufacturer, "Nest");
@@ -1754,7 +1907,7 @@ function processDeviceforHomeKit(nestObject, nestDevice, action) {
                 if (tempModel == "") tempModel = "Cam - type " + nestDevice.serial_number.substr(0,2) ; // Unknown camera type
 
                 var tempAccessory = exports.accessory = new Accessory("Nest " + tempModel, uuid.generate("hap-nodejs:accessories:nest_" + nestDevice.serial_number));
-                tempAccessory.username = tempMACAddress;
+                tempAccessory.username = nestDevice.mac_address;
                 tempAccessory.pincode = AccessoryPincode;
                 tempAccessory.category = nestDevice.device_type == "doorbell" ? Accessory.Categories.VIDEO_DOORBELL : Accessory.Categories.IP_CAMERA;
                 tempAccessory.getService(Service.AccessoryInformation).setCharacteristic(Characteristic.Manufacturer, "Nest");
@@ -1780,11 +1933,10 @@ function processDeviceforHomeKit(nestObject, nestDevice, action) {
 
     if (action == false && typeof nestDevice == "object") {
         // Removing device from HomeKit.. not sure want todo this yet... :-)
-        // perhaps if has been published and un-paired, unpublish from HomeKit???
         nestObject.removeSubcription(nestDevice.serial_number); // Remove any active subscription for this device
 
         // find our accessory, then unpublish it and remove from HAP-NodeJS "accessory factory"
-        var accessoryIndex = accessories.findIndex(({username}) => username === tempMACAddress);
+        var accessoryIndex = accessories.findIndex(({username}) => username === nestDevice.mac_address);
         if (accessoryIndex != -1 && accessories[accessoryIndex] && accessories[accessoryIndex].__thisObject.__nestDeviceID == nestDevice.serial_number) {
             console.log("DEBUG: Removed Nest Device '%s' on '%s'", accessories[accessoryIndex].displayName, accessories[accessoryIndex].username);
             accessories[accessoryIndex].unpublish();
@@ -1796,11 +1948,15 @@ function processDeviceforHomeKit(nestObject, nestDevice, action) {
 
 // Startup code
 var nest = new NestClass();
-nest.getNestData(true)
-.then(() => {
-    nest.__currentNestData.device && Object.entries(nest.__currentNestData.device).forEach(([deviceID, nestDevice]) => {
-        // Process discovered device into HomeKit
-        processDeviceforHomeKit(nest, nestDevice, true);    
+if (nest.__nestToken != null) {
+    nest.getNestData(true)
+    .then(() => {
+        nest.__currentNestData.device && Object.entries(nest.__currentNestData.device).forEach(([deviceID, nestDevice]) => {
+            // Process discovered device into HomeKit
+            processDeviceforHomeKit(nest, nestDevice, true);    
+        });
+        nest.addSubscription(null, null, processDeviceforHomeKit);  // Subscribe for device additions/removals
     });
-    nest.addSubscription(null, null, processDeviceforHomeKit);  // Subscribe for device additions/removals
-});
+} else {
+    console.log("No session token specified in configuration");
+}

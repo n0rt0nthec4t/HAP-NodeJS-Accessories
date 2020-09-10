@@ -1,0 +1,10 @@
+{
+    "SessionToken" : "",
+    "THERMOSTATSERIAL" : {
+        "exclude": false,
+        "option.coolingURL" : "",
+        "option.fanURL" : "",
+        "option.heatingURL" : "",
+
+    }
+}
