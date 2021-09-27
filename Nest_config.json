@@ -1,10 +1,3 @@
 {
-    "SessionToken" : "",
-    "THERMOSTATSERIAL" : {
-        "exclude": false,
-        "option.coolingURL" : "",
-        "option.fanURL" : "",
-        "option.heatingURL" : "",
-
-    }
+    "SessionToken" : "<nest session token here"
 }

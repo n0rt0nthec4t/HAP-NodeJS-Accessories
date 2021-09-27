@@ -1,10 +1,10 @@
 // HomeKit history service
 // Simple history service for HomeKit developed accessories with HAP-NodeJS
 //
-// todo
-// -- get humidity recordings for EveHome thermo
-// -- get history to show for EveHome motion when attached to a smoke sensor
-// -- doorbell button press hsitory to show
+// todo (EveHome integration)
+// -- get history to show for motion when attached to a smoke sensor
+// -- get history to show for smoke when attached to a smoke sensor
+// -- thermo schedules/additonal characteris
 //
 // done
 // -- initial support for importing our history into EveHome
@@ -12,16 +12,12 @@
 // -- import history for sprinkler/irrigation systems to EveHome (Aqua)
 // -- fixed door history bug with inverted status
 // -- notify Eve when new history entries added
+// -- get humidity recordings for EveHome thermo
 //
-// bugs
-// -- when motion sensor paired with smoke service, EveHome thinks its an Eve Smoke, but no motion history shows
-//
-// Version 25/8/2020
+// Version 31/3/2021
 // Mark Hulskamp
 
 const MAX_HISTORY_SIZE = 16384; // 16k entries
-const EPOCH_OFFSET = 978307200; // Seconds since 1/1/1970 to 1/1/2001
-const EVEHOME_MAX_STREAM = 11;  // Maximum number of history events we can stream to EveHome at once
 
 var Service = require("../").Service;
 var Characteristic = require("../").Characteristic;
@@ -130,17 +126,31 @@ HomeKitHistory.prototype.addHistory = function(service, entry) {
             break;
         }
 
+        case Service.AirQualitySensor.UUID :
         case Service.TemperatureSensor.UUID : {
             // Temperature sensor history
             // entry.time => unix time in seconds
             // entry.temperature => current temperature in degress C
             // entry.humidity => current humidity
+            // optional (entry.ppm)
+            // optional (entry.voc => current VOC measurement in µg/m3)
             historyEntry.temperature = entry.temperature;
             if (typeof entry.humidity == "undefined") {
                 // fill out humidity if missing
                 entry.humidity = 0;
             }
+            if (typeof entry.ppm == "undefined") {
+                // fill out ppm if missing
+                entry.ppm = 0;
+            }
+            if (typeof entry.voc == "undefined") {
+                // fill out voc if missing
+                entry.voc = 0;
+            }
+            historyEntry.temperature = entry.temperature;
             historyEntry.humidity = entry.humidity;
+            historyEntry.ppm = entry.ppm;
+            historyEntry.voc = entry.voc;
             if (typeof entry.restart != "undefined") historyEntry.restart = entry.restart;
             this.__addEntry(service.UUID, service.subtype, entry.time, historyEntry);
             break;
@@ -185,9 +195,19 @@ HomeKitHistory.prototype.addHistory = function(service, entry) {
         }
 
         case Service.Doorbell.UUID : {
-            // Motion sensor history
+            // Doorbell press history
             // entry.time => unix time in seconds
             // entry.status => 1 = doorbell pressed, 0 = not pressed
+            historyEntry.status = entry.status;
+            if (typeof entry.restart != "undefined") historyEntry.restart = entry.restart;
+            this.__addEntry(service.UUID, service.subtype, entry.time, historyEntry);
+            break;
+        }
+
+        case Service.SmokeSensor.UUID : {
+            // Smoke sensor history
+            // entry.time => unix time in seconds
+            // entry.status => 1 = smoke detected, 0 = smoke detected
             historyEntry.status = entry.status;
             if (typeof entry.restart != "undefined") historyEntry.restart = entry.restart;
             this.__addEntry(service.UUID, service.subtype, entry.time, historyEntry);
@@ -369,20 +389,32 @@ HomeKitHistory.prototype.__updateHistoryTypes = function() {
 // Alot of code taken from fakegato https://github.com/simont77/fakegato-history
 // references from https://github.com/ebaauw/homebridge-lib/blob/master/lib/EveHomeKitTypes.js
 //
+const EPOCH_OFFSET = 978307200; // Seconds since 1/1/1970 to 1/1/2001
+const EVEHOME_MAX_STREAM = 11;  // Maximum number of history events we can stream to EveHome at once
+
 var encodeEveData = function (string) {
-	return Buffer.from(('' + string).replace(/[^a-fA-F0-9]/ig, ''), 'hex').toString('base64');
+	return Buffer.from(("" + string).replace(/[^a-fA-F0-9]/ig, ""), "hex").toString("base64");
 }
 
 var decodeEveData = function (data) {
     if (typeof data != "string") return data;
-	return Buffer.from(data, 'base64').toString('hex');
+	return Buffer.from(data, "base64").toString("hex");
 }
 
 // Converts a number into a string for EveHome, including formatting to byte width and reverse byte order
 // handles upto 64bit values
 var numberToEveHexString = function (number, bytes) {
     if (typeof number != "number") return number;
-    var tempString = '0000000000000000' + number.toString(16);
+    var tempString = "0000000000000000" + number.toString(16);
+    tempString = tempString.slice(-1 * bytes).match(/[a-fA-F0-9]{2}/g).reverse().join('');
+    return tempString;
+}
+
+var floatToEveHexString = function (number, bytes) {
+    if (typeof number != "number") return number;
+    var buf = Buffer.allocUnsafe(4);
+    buf.writeFloatBE(number, 0);
+    var tempString = "0000000000000000" + buf.toString("hex");
     tempString = tempString.slice(-1 * bytes).match(/[a-fA-F0-9]{2}/g).reverse().join('');
     return tempString;
 }
@@ -394,28 +426,37 @@ var EveHexStringToNumber = function (string) {
     return Number(`0x${tempString}`);   // convert to number on return
 }
 
+// Converts Eve encoded hex string to floating number with optional precision for result
+var EveHexStringToFloat = function (string, precision) {
+    if (typeof string != "string") return string;
+    var tempString = string.match(/[a-fA-F0-9]{2}/g).reverse().join('');
+    var float = Buffer(tempString, "hex").readFloatBE(0);
+    return (precision != 0) ? float.toFixed(precision) : float;
+}
+
 // Overlay our history into EveHome. Can only have one service history exposed to EveHome (ATM... see if can work around)
 // Returns object created for our EveHome accessory if successfull
 HomeKitHistory.prototype.linkToEveHome = function(HomeKitAccessory, service, optionalParams) {
     var allowReset = false;
-    var processCommand = null;
+    var SetCommand = null;
+    var GetCommand = null;
     if (typeof (optionalParams) === "object") {
         allowReset = optionalParams.allowReset || false;    // Allow EveHome to reset our history (clear it)
-        processCommand = optionalParams.ProcessCommand || null; // function to process set data for commands outside of this library
+        SetCommand = optionalParams.SetCommand || null;     // function for set data for commands outside of this library
+        GetCommand = optionalParams.GetCommand || null;     // function for get data for commands outside of this library
     }
 
     if (typeof this.EveHome == "undefined" || (this.EveHome && this.EveHome.hasOwnProperty("service") == false)) {
         switch (service.UUID) {
             case Service.Door.UUID :
             case Service.Window.UUID :
-            case Service.WindowCovering.UUID : 
             case Service.GarageDoorOpener.UUID : {
                 // treat these as EveHome Door but with inverse status for open/closed
                 var historyService = HomeKitAccessory.addService(Service.EveHomeHistory, "", 1);
                 var tempHistory = this.getHistory(service.UUID, service.subtype);
                 var historyreftime = (tempHistory.length == 0 ? (this.historyData.reset - EPOCH_OFFSET) : (tempHistory[0].time - EPOCH_OFFSET));
 
-                this.EveHome = {service: historyService, type: service.UUID, sub: service.subtype, evetype: "door", signature1: "01 0601", signature2: "01", entry: 0, count: tempHistory.length, reftime: historyreftime, send: 0};
+                this.EveHome = {service: historyService, linkedservice: service, type: service.UUID, sub: service.subtype, evetype: "door", signature1: "01 0601", signature2: "01", entry: 0, count: tempHistory.length, reftime: historyreftime, send: 0};
                 service.addCharacteristic(Characteristic.EveLastActivation);
                 service.addCharacteristic(Characteristic.EveOpenDuration);
                 service.addCharacteristic(Characteristic.EveClosedDuration);
@@ -439,7 +480,7 @@ HomeKitHistory.prototype.linkToEveHome = function(HomeKitAccessory, service, opt
                 var tempHistory = this.getHistory(service.UUID, service.subtype);
                 var historyreftime = (tempHistory.length == 0 ? (this.historyData.reset - EPOCH_OFFSET) : (tempHistory[0].time - EPOCH_OFFSET));
 
-                this.EveHome = {service: historyService, type: service.UUID, sub: service.subtype, evetype: "contact", signature1: "01 0601", signature2: "01", entry: 0, count: tempHistory.length, reftime: historyreftime, send: 0};
+                this.EveHome = {service: historyService, linkedservice: service, type: service.UUID, sub: service.subtype, evetype: "contact", signature1: "01 0601", signature2: "01", entry: 0, count: tempHistory.length, reftime: historyreftime, send: 0};
                 service.addCharacteristic(Characteristic.EveLastActivation);
                 service.addCharacteristic(Characteristic.EveOpenDuration);
                 service.addCharacteristic(Characteristic.EveClosedDuration);
@@ -457,6 +498,105 @@ HomeKitHistory.prototype.linkToEveHome = function(HomeKitAccessory, service, opt
                 break;
             }
 
+            case Service.WindowCovering.UUID : 
+            {
+                // Treat as Eve MotionBlinds
+                var historyService = HomeKitAccessory.addService(Service.EveHomeHistory, "", 1);
+                var tempHistory = this.getHistory(service.UUID, service.subtype);
+                var historyreftime = (tempHistory.length == 0 ? (this.historyData.reset - EPOCH_OFFSET) : (tempHistory[0].time - EPOCH_OFFSET));
+                
+                this.EveHome = {service: historyService, linkedservice: service, type: service.UUID, sub: service.subtype, evetype: "blind", signature1: "01 0601", signature2: "01", entry: 0, count: tempHistory.length, reftime: historyreftime, send: 0};
+                service.addCharacteristic(Characteristic.EveGetConfiguration);
+                service.addCharacteristic(Characteristic.EveSetConfiguration);
+
+                //17      CurrentPosition
+                //18      TargetPosition
+                //19      PositionState
+
+                             /*   for (var index = 30; index < 115; index++) {
+  
+                    uuid = "E863F1" + numberToEveHexString(index, 2) + "-079E-48FF-8F27-9C2605A29F52";
+                   eval(`Characteristic.EveTest`+ index + ` = function () {Characteristic.call(this, "Eve Test "+ index, uuid); this.setProps({format: Characteristic.Formats.DATA,perms: [Characteristic.Perms.READ, Characteristic.Perms.NOTIFY]});this.value = this.getDefaultValue();}`);
+                   util.inherits(eval(`Characteristic.EveTest`+ index), Characteristic);
+                   eval(`Characteristic.EveTest`+ index + `.UUID = uuid`);
+                   service.addCharacteristic(eval(`Characteristic.EveTest`+ index));
+                   console.log(uuid)
+                
+                } */
+             
+                this.productid = 00;
+
+                service.getCharacteristic(Characteristic.EveGetConfiguration).on("get", (callback) => {
+                    var value = util.format(
+                        "0002 %s 0302 %s 9b04 %s 1e02 %s 0c",
+                        numberToEveHexString(this.productid, 4),
+                        numberToEveHexString(1300, 4),  // firmware version (build xxxx)
+                        numberToEveHexString(Math.floor(new Date() / 1000), 8), // "now" time
+                        numberToEveHexString(this.productid, 4));
+    
+                        console.log("EveGetConfiguration", value);
+
+                        this.productid = this.productid + 1;
+
+                        callback(null, encodeEveData(value));
+                });
+
+               service.getCharacteristic(Characteristic.EveSetConfiguration).on("set", (value, callback) => {
+                    var processedData = {};
+                    var valHex = decodeEveData(value);
+                    var index = 0;
+
+                    console.log("EveSetConfiguration", valHex);
+
+                    while (index < valHex.length) {
+                        // first byte is command in this data stream
+                        // second byte is size of data for command
+                        command = valHex.substr(index, 2);
+                        size = parseInt(valHex.substr(index + 2, 2), 16) * 2;
+                        data = valHex.substr(index + 4, parseInt(valHex.substr(index + 2, 2), 16) * 2);
+                        switch(command) {
+                            case "00" : {
+                                // end of command?
+                                break;
+                            }
+
+                            case "f0" : {
+                                // set limits
+                                // data
+                                // 02 bottom position set
+                                // 01 top position set
+                                // 04 favourite position set
+                                break;
+                            }
+
+                            case "f1" : {
+                                // orientation set??
+                                break;
+                            }
+
+                            case "f3" : {
+                                // move window covering to set limits
+                                // data
+                                // 01c800 move up single press
+                                // 02c800 move down single press    
+                                // 01d007 move up hold press
+                                // 02d007 move down hold press
+                                // 030000 stop from hold press
+                                break;
+                            }
+
+                            default : {
+                                console.log("DEBUG: Unknown Eve MotionBlinds command '%s' with data '%s'", command, data);
+                                break;
+                            }
+                        }
+                        index += (4 + size);  // Move to next command accounting for header size of 4 bytes
+                    }
+                    callback();
+                });
+                break;
+            }
+
             case Service.HeaterCooler.UUID :
             case Service.Thermostat.UUID : {
                 // treat these as EveHome Thermo
@@ -464,19 +604,285 @@ HomeKitHistory.prototype.linkToEveHome = function(HomeKitAccessory, service, opt
                 var tempHistory = this.getHistory(service.UUID, service.subtype);
                 var historyreftime = (tempHistory.length == 0 ? (this.historyData.reset - EPOCH_OFFSET) : (tempHistory[0].time - EPOCH_OFFSET));
 
-                this.EveHome = {service: historyService, type: service.UUID, sub: service.subtype, evetype: "thermo", signature1: "05 0102 1102 1001 1201 1d01", signature2: "1f", entry: 0, count: tempHistory.length, reftime: historyreftime, send: 0}; 
-                service.addCharacteristic(Characteristic.EveValvePosition);   // Needed to show history for thermostating heating modes (valve position)
+                this.EveHome = {service: historyService, linkedservice: service, type: service.UUID, sub: service.subtype, evetype: "thermo", signature1: "06 0102 0202 1102 1001 1201 1d01", signature2: "3f", entry: 0, count: tempHistory.length, reftime: historyreftime, send: 0}; 
+                
+                // Need some internal storage to track Eve Thermo configuration from EveHome app
+                this.__EveThermoPersist = {};
+                this.__EveThermoPersist.firmware = optionalParams.hasOwnProperty("EveThermo_firmware") ? optionalParams.EveThermo_firmware : 1251; // Firmware version 1251 2015 thermo, 2834 2020 thermo
+                this.__EveThermoPersist.attached = optionalParams.hasOwnProperty("EveThermo_attached") ? optionalParams.EveThermo_attached : false; // attached to base?
+                this.__EveThermoPersist.tempoffset = optionalParams.hasOwnProperty("EveThermo_tempoffset") ? optionalParams.EveThermo_tempoffset: -2.5; // Temperature offset. default -2.5
+                this.__EveThermoPersist.enableschedule = optionalParams.hasOwnProperty("EveThermo_enableschedule") ? optionalParams.EveThermo_enableschedule : false; // Schedules on/off
+                this.__EveThermoPersist.pause = optionalParams.hasOwnProperty("EveThermo_pause") ? optionalParams.EveThermo_pause : false; // Paused on/off
+                this.__EveThermoPersist.away = optionalParams.hasOwnProperty("EveThermo_away") ? optionalParams.EveThermo_away : false; // Vacation status - disabled ie: Home
+                this.__EveThermoPersist.awaytemp = optionalParams.hasOwnProperty("EveThermo_awaytemp") ? optionalParams.EveThermo_awaytemp : 0xff; // Vacation temp disabled
+                this.__EveThermoPersist.command1a = optionalParams.hasOwnProperty("EveThermo_command1a") ? optionalParams.EveThermo_command1a : ""; 
+                this.__EveThermoPersist.commandf4 = optionalParams.hasOwnProperty("EveThermo_commandf4") ? optionalParams.EveThermo_commandf4 : "";
+                this.__EveThermoPersist.commandfa = optionalParams.hasOwnProperty("EveThermo_commandfa") ? optionalParams.EveThermo_commandfa : "";
+                
+                service.addCharacteristic(Characteristic.EveValvePosition);   // Needed to show history for thermostat heating modes (valve position)
+                service.addCharacteristic(Characteristic.EveFirmware);
+                service.addCharacteristic(Characteristic.EveProgramData);
+                service.addCharacteristic(Characteristic.EveProgramCommand);
+                if (service.testCharacteristic(Characteristic.CurrentTemperature) === false) service.addCharacteristic(Characteristic.CurrentTemperature);
+                if (service.testCharacteristic(Characteristic.TemperatureDisplayUnits) === false) service.addCharacteristic(Characteristic.TemperatureDisplayUnits);
+                if (service.testCharacteristic(Characteristic.LockPhysicalControls) == false) service.addCharacteristic(Characteristic.LockPhysicalControls); // Allows childlock toggle to be displayed in Eve App
+
+                service.getCharacteristic(Characteristic.EveFirmware).updateValue(encodeEveData(util.format("2c %s be", numberToEveHexString(this.__EveThermoPersist.firmware, 4))));  // firmware version (build xxxx)));
+                
+                // TODO - before enabling below need to workout:
+                //          - mode graph to show
+                //          - temperature unit setting
+                //          - thermo 2020??
+                service.getCharacteristic(Characteristic.EveProgramData).on("get", (callback) => {
+                    // commands
+                    // 11 - valve protection on/off - TODO
+                    // 12 - temp offset
+                    // 13 - schedules enabled/disabled
+                    // 16 - Window/Door open status
+                    //          100000 - open
+                    //          000000 - close
+                    // 14 - installation status
+                    //          c0,c8 = ok
+                    //          c1,c6,c9 = in-progress
+                    //          c2,c3,c4,c5 = error on removal
+                    //          c7 = not attached
+                    // 19 - vacation mode
+                    //          00ff - off
+                    //          01 + "away temp" - enabled with temp
+                    // f4 - temperatures
+                    // fa - programs for week
+                    // 1a - default day program
+
+                    if (typeof optionalParams.GetCommand == "function") this.__EveThermo = optionGetFunction(this.__EveThermoPersist); // Fill in details we might want to be dynamic
+
+                    // Encode the temperature offset into an unsigned value
+                    var tempOffset = this.__EveThermoPersist.tempoffset * 10;
+                    if (tempOffset < 127) tempOffset = tempOffset + 256;
+
+                    var value = util.format(
+                        "12%s 13%s 14%s 19%s %s %s",
+                        numberToEveHexString(tempOffset, 2),
+                        this.__EveThermoPersist.enableschedule == true ? "01" : "00",
+                        service.getCharacteristic(Characteristic.StatusActive).value == true || optionalParams.EveThermo_attached == true ? "c0" : "c7",
+                        this.__EveThermoPersist.away == true ? "01" + numberToEveHexString(this.__EveThermoPersist.awaytemp * 2, 2) : "00ff", // away status and temp
+                        this.__EveThermoPersist.commandf4,
+                        this.__EveThermoPersist.command1a,
+                        this.__EveThermoPersist.commandfa);
+
+                    callback(null, encodeEveData(value));
+                });
+
+                service.getCharacteristic(Characteristic.EveProgramCommand).on("set", (value, callback) => {
+                    var programs = [];
+                    var scheduleTemps = [];
+                    var processedData = {};
+                    var valHex = decodeEveData(value);
+                    var index = 0;
+                    console.log(valHex)
+                    while (index < valHex.length) {
+                        command = valHex.substr(index, 2);
+                        index += 2; // skip over command value, and this is where data starts.
+                        switch(command) {
+                            case "00" : {
+                                // start of command string ??
+                                break;
+                            }
+                            
+                            case "06" : {
+                                // end of command string ??
+                                break;
+                            }
+
+                            case "7f" : {
+                                // end of command string ??
+                                break;
+                            }
+
+                            case "11" : {
+                                // valve calibration/protection??
+                                //0011ff00f22076
+                                // 00f22076 - 111100100010000001110110
+                                //            15868022
+                                // 7620f2   - 011101100010000011110010
+                                //            7741682
+                                console.log(Math.floor(new Date() / 1000));
+                                index += 10;
+                                break;
+                            }
+
+                            case "10" : {
+                                // OK to remove
+                                break;
+                            }
+
+                            case "12" : {
+                                // temperature offset
+                                var tempOffset = parseInt(valHex.substr(index, 2), 16);
+                                if (tempOffset > 127) tempOffset = tempOffset - 256;
+                                tempOffset = tempOffset / 10;
+                                this.__EveThermoPersist.tempoffset = tempOffset;
+                                processedData.tempoffset = this.__EveThermoPersist.tempoffset;
+                                index += 2;
+                                break;
+                            }
+                            
+                            case "13" : {
+                                // schedules enabled/disable
+                                this.__EveThermoPersist.enableschedule = valHex.substr(index, 2) == "01" ? true : false;
+                                processedData.enableschedule = this.__EveThermoPersist.enableschedule;
+                                index += 2;
+                                break;
+                            }
+
+                            case "14" : {
+                                // Installed status
+                                index += 2;
+                                break;
+                            }
+
+                            case "18" : {
+                                // Pause/resume via HomeKit automation/scene
+                                // 20 - pause thermostat operation
+                                // 10 - resume thermostat operation
+                                this.__EveThermoPersist.pause = valHex.substr(index, 2) == "20" ? true : false;
+                                processedData.pause = this.__EveThermoPersist.pause;
+                                index += 2;
+                                break;
+                            }
+
+                            case "19" : {
+                                // Vacation on/off, vacation temperature via HomeKit automation/scene
+                                var awayStatus = valHex.substr(index, 2) == "01" ? true : false;
+                                var awayTemp = parseInt(valHex.substr(index + 2, 2), 16) * 0.5;
+                                this.__EveThermoPersist.away = awayStatus;
+                                this.__EveThermoPersist.awaytemp = awayTemp;
+                                processedData.away = {"status": this.__EveThermoPersist.away, "temp": this.__EveThermoPersist.awaytemp};
+                                index += 4;
+                                break;
+                            }
+
+                            case "f4" : {
+                                // Temperature Levels for schedule
+                                this.__EveThermoPersist.commandf4 = "f400" + valHex.substr(index, 6); // save the command string
+                                var currentTemp = valHex.substr(index, 2) == "80" ? null : parseInt(valHex.substr(index, 2), 16) * 0.5;
+                                var ecoTemp = valHex.substr(index + 2, 2) == "80" ? null : parseInt(valHex.substr(index + 2, 2), 16) * 0.5;
+                                var comfortTemp = valHex.substr(index + 4, 2) == "80" ? null : parseInt(valHex.substr(index + 4, 2), 16) * 0.5;
+                                scheduleTemps = [ecoTemp, comfortTemp];
+                                index += 6;
+                                break;
+                            }
+
+                            case "fc" : {
+                                // Date/Time
+                                index += 10;
+                                break;
+                            }       
+
+                            case "fa" : {
+                                // Programs (week - mon, tue, wed, thu, fri, sat, sun)
+                                // index += 112;
+                                this.__EveThermoPersist.commandfa = command + valHex.substr(index, 112); // save the command string
+                                var daysofweek = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+                                for (index2 = 0; index2 < 7; index2++) {
+                                    var times = [];
+                                    for (index3 = 0; index3 < 4; index3++) {
+                                        // decode start time
+                                        var start = parseInt(valHex.substr(index, 2), 16);
+                                        var start_min = null;
+                                        var start_hr = null;
+                                        var start_offset = null;
+                                        if (start != 0xff) {
+                                            start_min = (start * 10) % 60;   // Start minute
+                                            start_hr = ((start * 10) - start_min) / 60;    // Start hour
+                                            start_offset = ((start * 10) * 60);    // Seconds since 00:00
+                                        }
+
+                                        // decode end time
+                                        var end = parseInt(valHex.substr(index + 2, 2), 16);
+                                        var end_min = null;
+                                        var end_hr = null;
+                                        var end_offset = null;
+                                        if (end != 0xff) {
+                                            end_min = (end * 10) % 60;   // End minute
+                                            end_hr = ((end * 10) - end_min) / 60;    // End hour
+                                            end_offset = ((end * 10) * 60);    // Seconds since 00:00
+                                        }
+            
+                                        if (start_offset != null && end_offset != null) {
+                                            times.push({"type" : "time", "offset": start_offset, "duration" : (end_offset - start_offset)});
+                                        }
+                                        index += 4;
+                                    }
+                                    programs.push({"id": index2 + 1, "days": daysofweek[index2], "schedule": times, "temperature" : scheduleTemps});
+                                }
+                                processedData.programs = programs;               
+                                break;
+                            }
+
+                            case "1a" : {
+                                // Program (day)
+                                index += 16;
+                                break;
+                            }
+
+                            case "f2" : {
+                                // ??
+                                index += 2;
+                                break;
+                            }  
+
+                            case "f6" : {
+                                //??
+                                index += 6;
+                                break;
+                            }
+
+                            case "ff" : {
+                                // ??
+                                index += 4;
+                                break;
+                            }
+
+                            default : {
+                                console.log("DEBUG: Unknown Eve Thermo command '%s'", command);
+                                break
+                            }
+                        }
+                    };
+
+                    // Send complete processed command data if configured to our callback
+                    if (typeof optionalParams.SetCommand == "function" && Object.keys(processedData).length != 0) optionalParams.SetCommand(processedData);
+                    callback();
+                });
                 break;
             }
 
+            case Service.AirQualitySensor.UUID :
             case Service.TemperatureSensor.UUID : {
-                // treat these as EveHome Room
+                // treat these as EveHome Room(s)
                 var historyService = HomeKitAccessory.addService(Service.EveHomeHistory, "", 1);
                 var tempHistory = this.getHistory(service.UUID, service.subtype);
                 var historyreftime = (tempHistory.length == 0 ? (this.historyData.reset - EPOCH_OFFSET) : (tempHistory[0].time - EPOCH_OFFSET));
 
-                this.EveHome = {service: historyService, type: service.UUID, sub: service.subtype, evetype: "room", signature1: "04 0102 0202 0402 0f03", signature2: "0f", entry: 0, count: tempHistory.length, reftime: historyreftime, send: 0};
-                service.addCharacteristic(Characteristic.TemperatureDisplayUnits); // Needed to show history for temperature
+                service.addCharacteristic(Characteristic.EveFirmware);
+
+                if (service.UUID == Service.AirQualitySensor.UUID) {
+                    // Eve Room 2 (2018)
+                    service.getCharacteristic(Characteristic.EveFirmware).updateValue(encodeEveData(util.format("27 %s be", numberToEveHexString(1151, 4))));  // firmware version (build xxxx)));
+
+                    this.EveHome = {service: historyService, linkedservice: service, type: service.UUID, sub: service.subtype, evetype: "room2", signature1: "07 0102 0202 2202 2901 2501 2302 2801", signature2: "7f", entry: 0, count: tempHistory.length, reftime: historyreftime, send: 0};
+                    if (service.testCharacteristic(Characteristic.VOCDensity) == false) service.addCharacteristic(Characteristic.VOCDensity);
+                }
+
+                if (service.UUID == Service.TemperatureSensor.UUID) {
+                    // Eve Room (2015)
+                    service.getCharacteristic(Characteristic.EveFirmware).updateValue(encodeEveData(util.format("02 %s be", numberToEveHexString(1151, 4))));  // firmware version (build xxxx)));
+
+                    this.EveHome = {service: historyService, linkedservice: service, type: service.UUID, sub: service.subtype, evetype: "room", signature1: "04 0102 0202 0402 0f03", signature2: "1f", entry: 0, count: tempHistory.length, reftime: historyreftime, send: 0};
+                }
+
+                if (service.testCharacteristic(Characteristic.TemperatureDisplayUnits) == false) service.addCharacteristic(Characteristic.TemperatureDisplayUnits); // Needed to show history for temperature
+                service.getCharacteristic(Characteristic.TemperatureDisplayUnits).updateValue(Characteristic.TemperatureDisplayUnits.CELSIUS);  // Temperature needs to be in Celsius
                 break;
             }
 
@@ -486,89 +892,307 @@ HomeKitHistory.prototype.linkToEveHome = function(HomeKitAccessory, service, opt
                 var tempHistory = this.getHistory(service.UUID, service.subtype);
                 var historyreftime = (tempHistory.length == 0 ? (this.historyData.reset - EPOCH_OFFSET) : (tempHistory[0].time - EPOCH_OFFSET));
 
-                this.EveHome = {service: historyService, type: service.UUID, sub: service.subtype, evetype: "motion", signature1:"02 1301 1c01", signature2: "02", entry: 0, count: tempHistory.length, reftime: historyreftime, send: 0};
+                // Need some internal storage to track Eve Motion configuration from EveHome app
+                this.__EveMotionPersist = {};
+                this.__EveMotionPersist.duration = optionalParams.hasOwnProperty("EveMotion_duration") ? optionalParams.EveMotion_duration : 5; // default 5 seconds
+                this.__EveMotionPersist.sensitivity = optionalParams.hasOwnProperty("EveMotion_sensitivity") ? optionalParams.EveMotion_sensivity : Characteristic.EveSensitivity.HIGH; // default sensitivity
+
+                this.EveHome = {service: historyService, linkedservice: service, type: service.UUID, sub: service.subtype, evetype: "motion", signature1:"02 1301 1c01", signature2: "02", entry: 0, count: tempHistory.length, reftime: historyreftime, send: 0};
                 service.addCharacteristic(Characteristic.EveSensitivity);
                 service.addCharacteristic(Characteristic.EveDuration);
                 service.addCharacteristic(Characteristic.EveLastActivation);
-
-                // TODO - What to add if on an accessory with a Smoke service to show motion history?
 
                 // Setup initial values and callbacks for charateristics we are using
                 service.getCharacteristic(Characteristic.EveLastActivation).updateValue(this.__EveLastEventTime()); // time of last event in seconds since first event
                 service.getCharacteristic(Characteristic.EveLastActivation).on("get", (callback) => {
                     callback(null, this.__EveLastEventTime());  // time of last event in seconds since first event
-                });  
+                });
+
+                service.getCharacteristic(Characteristic.EveSensitivity).update(this.__EveMotionPersist.sensitivity);
+                service.getCharacteristic(Characteristic.EveSensitivity).on("get", (callback) => {
+                    callback(null, this.__EveMotionPersist.sensitivity);
+                });
+                service.getCharacteristic(Characteristic.EveSensitivity).on("set", (value, callback) => {
+                    this.__EveMotionPersist.sensitivity = value;
+                    callback();
+                });
+
+                service.getCharacteristic(Characteristic.EveDuration).update(this.__EveMotionPersist.duration);
+                service.getCharacteristic(Characteristic.EveDuration).on("get", (callback) => {
+                    callback(null, this.__EveMotionPersist.duration);
+                });
+                service.getCharacteristic(Characteristic.EveDuration).on("set", (value, callback) => {
+                    this.__EveMotionPersist.duration = value; 
+                    callback();
+                });
                 break;
             }
 
-            case Service.Valve.UUID : {
-                // treat these as EveHome Aqua
-                // for a specific valve
+            case Service.SmokeSensor.UUID : {
+                // treat these as EveHome Smoke
                 var historyService = HomeKitAccessory.addService(Service.EveHomeHistory, "", 1);
                 var tempHistory = this.getHistory(service.UUID, service.subtype);
                 var historyreftime = (tempHistory.length == 0 ? (this.historyData.reset - EPOCH_OFFSET) : (tempHistory[0].time - EPOCH_OFFSET));
+                // TODO = work out what the "signatures" need to be for an Eve Smoke
+                // Also, how to make alarm test button active in Eve app and not say "not correctly mounted"
+           
+                this.EveHome = {service: historyService, linkedservice: service, type: service.UUID, sub: service.subtype, evetype: "smoke", signature1: "04 0f01 1601 1b08 2202", signature2: "1f", entry: 0, count: tempHistory.length, reftime: historyreftime, send: 0};
 
-                this.EveHome = {service: historyService, type: service.UUID, sub: service.subtype, evetype: "aqua", signature1: "03 1f01 2a08 2302", signature2: "05", signature3: "07", entry: 0, count: tempHistory.length, reftime: historyreftime, send: 0};
+                // Need some internal storage to track Eve Smoke configuration from EveHome app
+                this.__EveSmokePersist = {};
+                this.__EveSmokePersist.firmware = optionalParams.hasOwnProperty("EveSmoke_firmware") ? optionalParams.EveSmoke_firmware : 1208; // Firmware version
+                this.__EveSmokePersist.lastalarmtest = optionalParams.hasOwnProperty("EveSmoke_lastalarmtest") ? optionalParams.EveSmoke_lastalarmtest : 0; // Time in seconds of alarm test
+                this.__EveSmokePersist.alarmtest = optionalParams.hasOwnProperty("EveSmoke_alarmtest") ? optionalParams.EveSmoke_alarmtest : false; // Is alarmtest running
+                this.__EveSmokePersist.heatstatus = optionalParams.hasOwnProperty("EveSmoke_heatstatus") ? optionalParams.EveSmoke_heatstatus : 0; // Heat sensor status
+                this.__EveSmokePersist.statusled = optionalParams.hasOwnProperty("EveSmoke_statusled") ? optionalParams.EveSmoke_statusled: true; // Status LED flash/enabled
+                this.__EveSmokePersist.smoketestpassed = optionalParams.hasOwnProperty("EveSmoke_smoketestpassed") ? optionalParams.EveSmoke_smoketestpassed: true; // Passed smoke test?
+                this.__EveSmokePersist.heattestpassed = optionalParams.hasOwnProperty("EveSmoke_heattestpassed") ? optionalParams.EveSmoke_heattestpassed: true; // Passed smoke test?
+                this.__EveSmokePersist.hushedstate = optionalParams.hasOwnProperty("EveSmoke_hushedstate") ? optionalParams.EveSmoke_hushedstate : false; // Alarms muted
+      
                 service.addCharacteristic(Characteristic.EveGetConfiguration);
                 service.addCharacteristic(Characteristic.EveSetConfiguration);
-
+                service.addCharacteristic(Characteristic.EveDeviceStatus);
+           
                 // Setup initial values and callbacks for charateristics we are using
-                service.getCharacteristic(Characteristic.EveGetConfiguration).updateValue(this.__EveAquaWaterDetails());
+                service.getCharacteristic(Characteristic.EveDeviceStatus).updateValue(this.__EveSmokeGetDetails(optionalParams.GetCommand, Characteristic.EveDeviceStatus.UUID));
+                service.getCharacteristic(Characteristic.EveDeviceStatus).on("get", (callback) => {
+                    callback(null, this.__EveSmokeGetDetails(optionalParams.GetCommand, Characteristic.EveDeviceStatus.UUID));
+                });
+  
+                service.getCharacteristic(Characteristic.EveGetConfiguration).updateValue(this.__EveSmokeGetDetails(optionalParams.GetCommand, Characteristic.EveGetConfiguration.UUID));
                 service.getCharacteristic(Characteristic.EveGetConfiguration).on("get", (callback) => {
-                    callback(null, this.__EveAquaWaterDetails());
-                }); 
+                    callback(null, this.__EveSmokeGetDetails(optionalParams.GetCommand, Characteristic.EveGetConfiguration.UUID));
+                });
+
+                service.getCharacteristic(Characteristic.EveSetConfiguration).on("set", (value, callback) => {
+                    // Loop through set commands passed to us
+                    var processedData = {};
+                    var valHex = decodeEveData(value);
+                    var index = 0;
+                    while (index < valHex.length) {
+                        // first byte is command in this data stream
+                        // second byte is size of data for command
+                        command = valHex.substr(index, 2);
+                        size = parseInt(valHex.substr(index + 2, 2), 16) * 2;
+                        data = valHex.substr(index + 4, parseInt(valHex.substr(index + 2, 2), 16) * 2);
+                        switch(command) {
+                            case "40" : {
+                                var subCommand = EveHexStringToNumber(data.substr(0, 2));
+                                if (subCommand == 0x02) {
+                                    // Alarm test start/stop
+                                    this.__EveSmokePersist.alarmtest = (data == "0201") ? true : false;
+                                    processedData.alarmtest = this.__EveSmokePersist.alarmtest;
+                                }
+                                if (subCommand == 0x05) {
+                                     // Flash status Led on/off
+                                    this.__EveSmokePersist.statusled = (data == "0501") ? true : false;
+                                    processedData.statusled = this.__EveSmokePersist.statusled;
+                                }
+                                if (subCommand != 0x02 && subCommand != 0x05) {
+                                    console.log("DEBUG: Unknown Eve Smoke command '%s' with data '%s'", command, data);
+                                }
+                                break;
+                            }
+
+                           // case "41" : {
+                               // "59b8" - "b859" - 1011100001011001 17/3
+                               // "8aa5" - "a58a" - 1010010110001010 18/3
+                             //   break;
+                           // }
+
+                            default : {
+                                console.log("DEBUG: Unknown Eve Smoke command '%s' with data '%s'", command, data);
+                                break;
+                            }
+                        }
+                        index += (4 + size);  // Move to next command accounting for header size of 4 bytes
+                    };
+
+                    // Send complete processed command data if configured to our callback
+                    if (typeof optionalParams.SetCommand == "function" && Object.keys(processedData).length != 0) optionalParams.SetCommand(processedData);
+                    callback();
+                });
+      
                 break;
             }
 
+            case Service.Valve.UUID :
             case Service.IrrigationSystem.UUID : {
                 // treat an irrigation system as EveHome Aqua
                 // Under this, any valve history will be presented under this. We dont log our History under irrigation service ID at all
 
                 // TODO - see if we can add history per valve service under the irrigation system????. History service per valve???
                 var historyService = HomeKitAccessory.addService(Service.EveHomeHistory, "", 1);  
-                var tempHistory = this.getHistory(Service.Valve.UUID, null);
+                var tempHistory = this.getHistory(Service.Valve.UUID, (service.UUID == Service.IrrigationSystem.UUID ? null : service.subtype));
                 var historyreftime = (tempHistory.length == 0 ? (this.historyData.reset - EPOCH_OFFSET) : (tempHistory[0].time - EPOCH_OFFSET));
   
-                this.EveHome = {service: historyService, type: Service.Valve.UUID, sub: null, evetype: "aqua", signature1: "03 1f01 2a08 2302", signature2: "05", signature3: "07", entry: 0, count: tempHistory.length, reftime: historyreftime, send: 0};
+                this.EveHome = {service: historyService, linkedservice: service, type: Service.Valve.UUID, sub: (service.UUID == Service.IrrigationSystem.UUID ? null : service.subtype), evetype: "aqua", signature1: "03 1f01 2a08 2302", signature2: "05", signature3: "07", entry: 0, count: tempHistory.length, reftime: historyreftime, send: 0};
                 service.addCharacteristic(Characteristic.EveGetConfiguration);
                 service.addCharacteristic(Characteristic.EveSetConfiguration);
+                if (service.testCharacteristic(Characteristic.LockPhysicalControls) == false) service.addCharacteristic(Characteristic.LockPhysicalControls); // Allows childlock toggle to be displayed in Eve App
 
+                // Need some internal storage to track Eve Aqua configuration from EveHome app
+                this.__EveAquaPersist = {};
+                this.__EveAquaPersist.firmware = optionalParams.hasOwnProperty("EveAqua_firmware") ? optionalParams.EveAqua_firmware : 1208; // Firmware version
+                this.__EveAquaPersist.flowrate = optionalParams.hasOwnProperty("EveAqua_flowrate") ? optionalParams.EveAqua_flowrate : 18; // 18 L/Min default
+                this.__EveAquaPersist.enableschedule = optionalParams.hasOwnProperty("EveAqua_enableschedule") ? optionalParams.EveAqua_enableschedule : false; // Schedules on/off
+                this.__EveAquaPersist.command44 = "441105" + (this.__EveAquaPersist.enableschedule == true ? "03" : "02") + "00000000000000000000000000000";  // schedule status. on or off
+                this.__EveAquaPersist.command45 = "4509050200000008000800"; // No Schedules defined
+                this.__EveAquaPersist.command46 = "4609050000000f00000000"; // No days defined for schedules
+             
                 // Setup initial values and callbacks for charateristics we are using
-                service.getCharacteristic(Characteristic.EveGetConfiguration).updateValue(this.__EveAquaWaterDetails());
+                service.getCharacteristic(Characteristic.EveGetConfiguration).updateValue(this.__EveAquaGetDetails(optionalParams.GetCommand));
                 service.getCharacteristic(Characteristic.EveGetConfiguration).on("get", (callback) => {
-                    callback(null, this.__EveAquaWaterDetails());
+                    callback(null, this.__EveAquaGetDetails(optionalParams.GetCommand));
                 });
                 service.getCharacteristic(Characteristic.EveSetConfiguration).on("set", (value, callback) => {
                     // Loop through set commands passed to us
+                    var programs = [];
+                    var processedData = {};
                     var valHex = decodeEveData(value);
                     var index = 0;
                     while (index < valHex.length) {
-                        // first byte is command
+                        // first byte is command in this data stream
                         // second byte is size of data for command
                         command = valHex.substr(index, 2);
                         size = parseInt(valHex.substr(index + 2, 2), 16) * 2;
                         data = valHex.substr(index + 4, parseInt(valHex.substr(index + 2, 2), 16) * 2);
-
                         switch(command) {
                             case "2e" : {
-                                // flow rate in ml/Minute
-                                var flowrateLS = EveHexStringToNumber(data) * 60; // flow rate in ml/Minute
+                                // flow rate in L/Minute
+                                this.__EveAquaPersist.flowrate = ((EveHexStringToNumber(data) * 60) / 1000).toFixed(1);
+                                processedData.flowrate = this.__EveAquaPersist.flowrate;
                                 break;
                             }
 
                             case "2f" : {
                                 // reset timestamp in seconds since EPOCH
-                                var timestamp = (EPOCH_OFFSET + EveHexStringToNumber(data));
+                                this.__EveAquaPersist.timestamp = (EPOCH_OFFSET + EveHexStringToNumber(data));
+                                processedData.timestamp = this.__EveAquaPersist.timestamp;
+                                break;
+                            }
+
+                            case "44" : {
+                                // Schedules on/off and Timezone/location information
+                                var subCommand = EveHexStringToNumber(data.substr(2, 4));
+                                this.__EveAquaPersist.command44 = command + valHex.substr(index + 2, 2) + data;
+                                this.__EveAquaPersist.enableschedule = (subCommand & 0x01) == 0x01;   // Bit 1 is schedule status on/off
+                                if ((subCommand & 0x10) == 0x10) this.__EveAquaPersist.utcoffset = EveHexStringToNumber(data.substr(10, 8)) * 60;   // Bit 5 is UTC offset in seconds
+                                if ((subCommand & 0x04) == 0x04) this.__EveAquaPersist.latitude = EveHexStringToFloat(data.substr(18, 8), 7);   // Bit 4 is lat/long information 
+                                if ((subCommand & 0x04) == 0x04) this.__EveAquaPersist.longitude = EveHexStringToFloat(data.substr(26, 8), 7);  // Bit 4 is lat/long information 
+                                if ((subCommand & 0x02) == 0x02) {
+                                    // If bit 2 is set, indicates just a schedule on/off command
+                                    processedData.enabled = this.__EveAquaPersist.enableschedule;
+                                }
+                                if ((subCommand & 0x02) != 0x02) {
+                                    // If bit 2 is not set, this command includes Timezone/location information
+                                    processedData.utcoffset = this.__EveAquaPersist.utcoffset;
+                                    processedData.latitude = this.__EveAquaPersist.latitude;
+                                    processedData.longitude = this.__EveAquaPersist.longitude;
+                                }
+                                break;
+                            }
+
+                            case "45" : {
+                                // Eve App Scheduling Programs
+                                this.__EveAquaPersist.command45 = command + valHex.substr(index + 2, 2) + data;
+                                var programcount = EveHexStringToNumber(data.substr(2, 2));   // Number of defined programs
+                                var unknown = EveHexStringToNumber(data.substr(4, 6));   // Unknown data for 6 bytes
+
+                                for (index2 = parseInt(data.substr(0, 2), 16) * 2; index2 < data.length; index2+=2) {
+                                    if (data.substr(index2, 2) == "0a" || data.substr(index2, 2) == "0b") {
+                                        var times = [];
+                                        for (var index3 = 0; index3 < parseInt(data.substr(index2 + 2, 2), 16) && parseInt(data.substr(index2 + 2, 2), 16) != 8; index3++)
+                                        {
+                                            // decode start time
+                                            var start = parseInt(data.substr(index2 + 4 + (index3 * 8), 4).match(/[a-fA-F0-9]{2}/g).reverse().join(''), 16);
+                                            var start_min = null;
+                                            var start_hr = null;
+                                            var start_offset = null;
+                                            var start_sunrise = null;
+                                            if ((start & 0x1f) == 5) {
+                                                // specific time
+                                                start_min = (start >>> 5) % 60;   // Start minute
+                                                start_hr = ((start >>> 5) - start_min) / 60;    // Start hour
+                                                start_offset = ((start >>> 5) * 60);    // Seconds since 00:00
+                                            } else if ((start & 0x1f) == 7) {
+                                                // sunrise/sunset
+                                                start_sunrise = ((start >>> 5) & 0x01);    // 1 = sunrise, 0 = sunset
+                                                start_offset = ((start >>> 6) & 0x01 ? ~((start >>> 7) * 60) + 1 : (start >>> 7) * 60);   // offset from sunrise/sunset (plus/minus value)
+                                            } 
+
+                                            // decode end time
+                                            var end = parseInt(data.substr(index2 + 4 + ((index3 * 8) + 4), 4).match(/[a-fA-F0-9]{2}/g).reverse().join(''), 16);
+                                            var end_min = null;
+                                            var end_hr = null;
+                                            var end_offset = null;
+                                            var end_sunrise = null;
+                                            if ((end & 0x1f) == 1) {
+                                                // specific time
+                                                end_min = (end >>> 5) % 60;   // End minute
+                                                end_hr = ((end >>> 5) - end_min) / 60;    // End hour
+                                                end_offset = ((end >>> 5) * 60);    // Seconds since 00:00
+                                            } else if ((end & 0x1f) == 3) {
+                                                end_sunrise = ((end >>> 5) & 0x01);    // 1 = sunrise, 0 = sunset
+                                                end_offset = ((end >>> 6) & 0x01 ? ~((end >>> 7) * 60) + 1 : (end >>> 7) * 60);   // offset from sunrise/sunset (plus/minus value)
+                                            }
+                
+                                            times.push({"type" : (start_sunrise == null ? "time" : (start_sunrise ? "sunrise" : "sunset")), "offset": start_offset, "duration" : (end_offset - start_offset)});
+                                        }
+                                        programs.push({"id": (programs.length + 1), "days": [], "schedule": times});
+                                        index2 += (index3 * 8);
+                                    }
+                                }
+                                break;
+                            }
+
+                            case "46" : {
+                                // Eve App active days across programs
+                                this.__EveAquaPersist.command46 = command + valHex.substr(index + 2, 2) + data;
+                                var unknown = EveHexStringToNumber(data.substr(0, 6));   // Unknown data for first 6 bytes
+                                var daysbitmask = (EveHexStringToNumber(data.substr(8, 6)) >>> 4);
+                                var daysofweek = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+                                programs.forEach(program => {
+                                    for (var index = 0; index < daysofweek.length; index++) {
+                                        if (((daysbitmask >>> (index * 3)) & 0x7) == program.id) {
+                                            program.days.push(daysofweek[index]);
+                                        }
+                                    }
+                                });
+
+                                processedData.programs = programs;
+                                break;
+                            }
+
+                            case "47" : {
+                                // Eve App DST information
+                                this.__EveAquaPersist.command47 = command + valHex.substr(index + 2, 2) + data;
+                                break;
+                            }
+
+                            case "4b" : {
+                                // Eve App suspension scene triggered from HomeKit
+                                processedData.days = EveHexStringToNumber(data.substr(0, 8)) / 1440; // 1440 mins in a day
+                                break;
+                            }
+
+                            case "b1" : {
+                                // Child lock on/off. Seems data packet is always same (0100), so inspect "Characteristic.LockPhysicalControls)" for actual status
+                                this.__EveAquaPersist.childlock = (service.getCharacteristic(Characteristic.LockPhysicalControls).value == Characteristic.CONTROL_LOCK_ENABLED ? true : false);
+                                processedData.childlock = this.__EveAquaPersist.childlock;
                                 break;
                             }
 
                             default : {
-                                if (typeof optionalParams.ProcessCommand == "function") optionalParams.ProcessCommand(command, data); // Send command to be processed if we havent handled it here
+                                console.log("DEBUG: Unknown Eve Aqua command '%s' with data '%s'", command, data);
                                 break;
                             }
                         }
-                        index += 4 + size;  // Move to next command accounting for header size of 4 bytes
+                        index += (4 + size);  // Move to next command accounting for header size of 4 bytes
                     };
+
+                    // Send complete processed command data if configured to our callback
+                    if (typeof optionalParams.SetCommand == "function" && Object.keys(processedData).length != 0) optionalParams.SetCommand(processedData);
                     callback();
                 });
                 break;
@@ -577,54 +1201,27 @@ HomeKitHistory.prototype.linkToEveHome = function(HomeKitAccessory, service, opt
             case Service.Outlet.UUID : {
                 // treat these as EveHome energy
                 var historyService = HomeKitAccessory.addService(Service.EveHomeHistory, "", 1);  
-                var tempHistory = this.getHistory(Service.Valve.UUID, null);
+                var tempHistory = this.getHistory(service.UUID, service.subtype);
                 var historyreftime = (tempHistory.length == 0 ? (this.historyData.reset - EPOCH_OFFSET) : (tempHistory[0].time - EPOCH_OFFSET));
 
-                this.EveHome = {service: historyService, type: service.UUID, sub: service.subtype, evetype: "energy", signature1: "04 0102 0202 0702 0f03", signature2: "1f", entry: 0, count: tempHistory.length, reftime: historyreftime, send: 0}; 
+                this.EveHome = {service: historyService, linkedservice: service, type: service.UUID, sub: service.subtype, evetype: "energy", signature1: "04 0102 0202 0702 0f03", signature2: "1f", entry: 0, count: tempHistory.length, reftime: historyreftime, send: 0}; 
                 service.addCharacteristic(Characteristic.EveVoltage);
                 service.addCharacteristic(Characteristic.EveElectricCurrent);
                 service.addCharacteristic(Characteristic.EveCurrentConsumption);
                 service.addCharacteristic(Characteristic.EveTotalConsumption);
 
                 // Setup initial values and callbacks for charateristics we are using
-                service.getCharacteristic(Characteristic.EveCurrentConsumption).updateValue(() => {
-                    // Use last history entry for currrent power consumption
-                    var historyEntry = this.lastHistory(this.EveHome.type, this.EveHome.sub);
-                    var lastWatts = 0;
-                    if (historyEntry && Object.keys(historyEntry).length != 0) {
-                        lastWatts = historyEntry.watts;
-                    }
-                    return lastWatts;
-                });
+                service.getCharacteristic(Characteristic.EveCurrentConsumption).updateValue(this.__EveEnergyCurrentPower());
+
                 service.getCharacteristic(Characteristic.EveCurrentConsumption).on("get", (callback) => {
-                    // Use last history entry for currrent power consumption
-                    var historyEntry = this.lastHistory(this.EveHome.type, this.EveHome.sub);
-                    var lastWatts = 0;
-                    if (historyEntry && Object.keys(historyEntry).length != 0) {
-                        lastWatts = historyEntry.watts;
-                    }
-                    callback(null, lastWatts);
+                    callback(null, this.__EveEnergyCurrentPower());
                 });
-                break;
-            }
-            
-            case Service.Doorbell.UUID : {
-                // treat these as EveHome button??
-                var historyService = HomeKitAccessory.addService(Service.EveHomeHistory, "", 1);
-                var tempHistory = this.getHistory(service.UUID, service.subtype);
-                var historyreftime = (tempHistory.length == 0 ? (this.historyData.reset - EPOCH_OFFSET) : (tempHistory[0].time - EPOCH_OFFSET));
-
-                this.EveHome = {service: historyService, type: service.UUID, sub: service.subtype, evetype: "switch", signature1: "01 0e01", signature2: "01", entry: 0, count: tempHistory.length, reftime: historyreftime, send: 0};
-                service.addCharacteristic(Characteristic.EveLastActivation);
-
-                // Setup initial values and callbacks for charateristics we are using
-                service.getCharacteristic(Characteristic.EveLastActivation).updateValue(this.__EveLastEventTime()); // time of last event in seconds since first event
                 break;
             }
         }
     
         // Setup callbacks if our service successfully created
-        if (typeof this.EveHome.service != "undefined" && this.EveHome.service != null) {
+        if (this.EveHome && this.EveHome.hasOwnProperty("service")) {
             this.EveHome.service.getCharacteristic(Characteristic.EveResetTotal).on("get", (callback) => {callback(null, this.historyData.reset - EPOCH_OFFSET)});   // time since history reset
             this.EveHome.service.getCharacteristic(Characteristic.EveHistoryStatus).on("get", this.__EveHistoryStatus.bind(this));
             this.EveHome.service.getCharacteristic(Characteristic.EveHistoryEntries).on("get", this.__EveHistoryEntries.bind(this));
@@ -634,6 +1231,18 @@ HomeKitHistory.prototype.linkToEveHome = function(HomeKitAccessory, service, opt
             return this.EveHome.service;    // Return service handle for our EveHome accessory service
         }
     }
+}
+
+HomeKitHistory.prototype.updateEveHome = function(service, optionalParams) {
+    if (this.EveHome && this.EveHome.hasOwnProperty("service")) {
+        switch (service.UUID) {
+            case Service.SmokeSensor.UUID : {
+                service.getCharacteristic(Characteristic.EveDeviceStatus).updateValue(this.__EveSmokeGetDetails(optionalParams.GetCommand, Characteristic.EveDeviceStatus.UUID));
+                service.getCharacteristic(Characteristic.EveGetConfiguration).updateValue(this.__EveSmokeGetDetails(optionalParams.GetCommand, Characteristic.EveGetConfiguration.UUID));
+                break;
+            }
+        }
+    }            
 }
 
 HomeKitHistory.prototype.__EveLastEventTime = function() {
@@ -646,9 +1255,8 @@ HomeKitHistory.prototype.__EveLastEventTime = function() {
     return lastTime;
 }
 
-HomeKitHistory.prototype.__EveAquaWaterDetails = function() {
+HomeKitHistory.prototype.__EveAquaGetDetails = function(optionGetFunction) {
     // returns an encoded value formatted for an Eve Aqua device for water usage and last water time
-    // todo encode schedules if set and water flow rate
     var tempHistory = this.getHistory(this.EveHome.type, this.EveHome.sub); // get flattened history array for easier processing
 
     // Calculate total water usage over history period
@@ -659,18 +1267,73 @@ HomeKitHistory.prototype.__EveAquaWaterDetails = function() {
             totalWater += parseFloat(historyEntry.water);
         }
     });
+    if (typeof optionGetFunction == "function") this.__EveAquaPersist = optionGetFunction(this.__EveAquaPersist); // Fill in details we might want to be dynamic
 
     var value = util.format(
-        "00022300 0302 %s 040c4156323248314130303036330602080007042a3000000b0200000501000204f82c00001401030f0400000000450505000000004609050000000e000042064411051c0005033c0000003a814b42a34d8c4047110594186d19071ad91ab40000003c00000048060500000000004a06050000000000d004 %s 9b04 %s 2f0e %s 0000 2e02 %s 00000000000000001e02300c",
-        //"00022300 0302 %s 45050500000000 4609050000000e0000 4806050000000000 4a06050000000000 d004 %s 9b04 %s 2f0e %s 0000 2e02 %s 00000000000000001e02300c",
-        //"0302 %s 45050500000000 4609050000000e0000 4806050000000000 4a06050000000000 d004 %s 9b04 %s 2f0e %s 0000 2e02 %s",
-
-        numberToEveHexString(1208, 4),  // firmware version (build 1208)
+        "0002 2300 0302 %s d004 %s 9b04 %s 2f0e %s 0000 2e02 %s %s %s %s 0000000000000000 1e02 2300 0c",
+        numberToEveHexString(this.__EveAquaPersist.firmware, 4),  // firmware version (build xxxx)
         numberToEveHexString(tempHistory.length != 0 ? tempHistory[tempHistory.length - 1].time : 0, 8),  // time of last event, 0 if never watered
         numberToEveHexString(Math.floor(new Date() / 1000), 8), // "now" time
         numberToEveHexString(Math.floor(totalWater * 1000), 16), // total water usage in ml (64bit value)
-        numberToEveHexString(Math.floor(0 / 60), 4)); // water flow rate in ml/L
+        numberToEveHexString(Math.floor((this.__EveAquaPersist.flowrate * 1000) / 60), 4), // water flow rate (16bit value)
+        this.__EveAquaPersist.command44,
+        this.__EveAquaPersist.command45,
+        this.__EveAquaPersist.command46);
+
     return encodeEveData(value);
+};
+
+HomeKitHistory.prototype.__EveEnergyCurrentPower = function() {
+    // Use last history entry for currrent power consumption
+    var historyEntry = this.lastHistory(this.EveHome.type, this.EveHome.sub);
+    var lastWatts = 0;
+    if (historyEntry && Object.keys(historyEntry).length != 0) {
+        lastWatts = historyEntry.watts;
+    }
+    return lastWatts;
+}
+
+HomeKitHistory.prototype.__EveSmokeGetDetails = function(optionGetFunction, returnForCharacteristic) {
+    // returns an encoded value formatted for an Eve Smoke device 
+    var returnValue = null;
+
+    if (typeof optionGetFunction == "function") this.__EveSmokePersist = optionGetFunction(this.__EveSmokePersist); // Fill in details we might want to be dynamic
+
+    if (returnForCharacteristic == Characteristic.EveGetConfiguration.UUID) {
+        var value = util.format(
+            "0002 1800 0302 %s 9b04 %s 8608 %s 1e02 1800 0c",
+            numberToEveHexString(this.__EveSmokePersist.firmware, 4),  // firmware version (build xxxx)
+            numberToEveHexString(Math.floor(new Date() / 1000), 8), // "now" time
+            numberToEveHexString(this.__EveSmokePersist.lastalarmtest, 16));    // Not sure why 64bit value???
+        returnValue = encodeEveData(value);
+    }
+
+    if (returnForCharacteristic == Characteristic.EveDeviceStatus.UUID) {
+        // Status bits
+        //  0 = Smoked Detected
+        //  1 = Heat Detected
+        //  2 = Alarm test active
+        //  5 = Smoke sensor error
+        //  6 = Heat sensor error
+        //  7 = Sensor error??
+        //  9 = Smoke chamber error
+        // 14 = Smoke sensor deactivated
+        // 15 = flash status led (on)
+        // 24 & 25 = alarms paused
+        // 25 = alarm muted
+        var value = 0x00000000;
+        if (this.EveHome.linkedservice.getCharacteristic(Characteristic.SmokeDetected).value == Characteristic.SmokeDetected.SMOKE_DETECTED) value |= (1 << 0);  // 1st bit, smoke detected
+        if (this.__EveSmokePersist.heatstatus != 0) value |= (1 << 1);    // 2th bit - heat detected
+        if (this.__EveSmokePersist.alarmtest == true) value |= (1 << 2);    // 4th bit - alarm test running
+        if (this.__EveSmokePersist.smoketestpassed == false) value |= (1 << 5);   // 5th bit - smoke test OK
+        if (this.__EveSmokePersist.heattestpassed == false) value |= (1 << 6);   // 6th bit - heat test OK
+        if (this.__EveSmokePersist.smoketestpassed == false) value |= (1 << 9);   // 9th bit - smoke test OK
+        if (this.__EveSmokePersist.statusled == true) value |= (1 << 15);   // 15th bit - flash status led
+        if (this.__EveSmokePersist.hushedstate == true) value |= (1 << 25);    // 25th bit, alarms muted
+ 
+        returnValue = value >>> 0;  // Ensure UINT32
+    }
+    return returnValue;
 };
 
 HomeKitHistory.prototype.__EveHistoryStatus = function(callback) {
@@ -687,9 +1350,9 @@ HomeKitHistory.prototype.__EveHistoryStatus = function(callback) {
         numberToEveHexString(this.EveHome.count, 4), // count of entries
         numberToEveHexString(this.maxEntries == 0 ? MAX_HISTORY_SIZE : this.maxEntries, 4),  // history max size
         numberToEveHexString(1, 8));  // first entry
-
+        
     callback(null, encodeEveData(value));
-    //console.log("DEBUG: __EveHistoryStatus: history for '%s:%s' (%s) - Entries %s", this.EveHome.type, this.EveHome.sub, this.EveHome.evetype, this.EveHome.count);
+    // console.log("DEBUG: __EveHistoryStatus: history for '%s:%s' (%s) - Entries %s", this.EveHome.type, this.EveHome.sub, this.EveHome.evetype, this.EveHome.count);
 }
 
 HomeKitHistory.prototype.__EveHistoryEntries = function(callback) {
@@ -699,7 +1362,7 @@ HomeKitHistory.prototype.__EveHistoryEntries = function(callback) {
         var tempHistory = this.getHistory(this.EveHome.type, this.EveHome.sub); // get flattened history array for easier processing
 
         dataStream += util.format(
-            " 15 %s 0100 0000 81 %s 0000 0000 00 0000",
+            "15 %s 0100 0000 81 %s 0000 0000 00 0000",
             numberToEveHexString(this.EveHome.entry, 8),
             numberToEveHexString(this.EveHome.reftime, 8)); // not sure this is actually needed
 
@@ -708,30 +1371,19 @@ HomeKitHistory.prototype.__EveHistoryEntries = function(callback) {
                 historyEntry = tempHistory[this.EveHome.entry - 1]; // need to map EveHome entry address to our data history, as EvenHome addreses start at 1
                 switch (this.EveHome.evetype) {
                     case "aqua" : {
-                        if (historyEntry.status == 1)  {
-                            // Valve opened
-                            dataStream += util.format(
-                                " 0d %s %s %s %s 300c",
-                                numberToEveHexString(this.EveHome.entry, 8),
-                                numberToEveHexString(historyEntry.time - this.EveHome.reftime - EPOCH_OFFSET, 8),
-                                this.EveHome.signature2,
-                                numberToEveHexString(historyEntry.status, 2));
-                        } else {
-                            // Valve closed
-                            dataStream += util.format(
-                                " 15 %s %s %s %s %s 00000000 300c",
-                                numberToEveHexString(this.EveHome.entry, 8),
-                                numberToEveHexString(historyEntry.time - this.EveHome.reftime - EPOCH_OFFSET, 8),
-                                this.EveHome.signature3,
-                                numberToEveHexString(historyEntry.status, 2),
-                                numberToEveHexString(Math.floor(parseFloat(historyEntry.water) * 1000), 8)); // in millilitres
-                        }
+                        dataStream += util.format(
+                            "15 %s %s %s %s %s 300c",
+                            numberToEveHexString(this.EveHome.entry, 8),
+                            numberToEveHexString(historyEntry.time - this.EveHome.reftime - EPOCH_OFFSET, 8),
+                            this.EveHome.signature3,
+                            numberToEveHexString(historyEntry.status, 2),
+                            numberToEveHexString(historyEntry.status == 1 ? 0 : Math.floor(parseFloat(historyEntry.water) * 1000), 16)); // in millilitres (64bit value)
                         break;
                     }
 
-                    case "room": {
+                    case "room" : {
                         dataStream += util.format(
-                            " 13 %s %s %s %s %s %s 0000 00",
+                            "13 %s %s %s %s %s %s 0000 00",
                             numberToEveHexString(this.EveHome.entry, 8),
                             numberToEveHexString(historyEntry.time - this.EveHome.reftime - EPOCH_OFFSET, 8),
                             this.EveHome.signature2,
@@ -741,9 +1393,21 @@ HomeKitHistory.prototype.__EveHistoryEntries = function(callback) {
                         break;
                     }
 
-                    case "weather": {
+                    case "room2" : {
                         dataStream += util.format(
-                            " 10 %s %s %s %s %s %s",
+                            "15 %s %s %s %s %s %s 0054 a80f01",
+                            numberToEveHexString(this.EveHome.entry, 8),
+                            numberToEveHexString(historyEntry.time - this.EveHome.reftime - EPOCH_OFFSET, 8),
+                            this.EveHome.signature2,
+                            numberToEveHexString(historyEntry.temperature * 100, 4), // temperature
+                            numberToEveHexString(historyEntry.humidity * 100, 4), // Humidity
+                            numberToEveHexString(historyEntry.hasOwnProperty("voc") ? historyEntry.voc : 0, 4)); // VOC - air quality
+                        break;
+                    }
+
+                    case "weather" : {
+                        dataStream += util.format(
+                            "10 %s %s %s %s %s %s",
                             numberToEveHexString(this.EveHome.entry, 8),
                             numberToEveHexString(historyEntry.time - this.EveHome.reftime - EPOCH_OFFSET, 8),
                             this.EveHome.signature2,
@@ -755,10 +1419,10 @@ HomeKitHistory.prototype.__EveHistoryEntries = function(callback) {
 
                     case "motion" : 
                     case "contact" : 
-                    case "switch " : {
+                    case "switch" : {
                         // contact, motion and switch sensors treated the same for status
                         dataStream += util.format(
-                            " 0b %s %s %s %s",
+                            "0b %s %s %s %s",
                             numberToEveHexString(this.EveHome.entry, 8),
                             numberToEveHexString(historyEntry.time - this.EveHome.reftime - EPOCH_OFFSET, 8),
                             this.EveHome.signature2,
@@ -770,7 +1434,7 @@ HomeKitHistory.prototype.__EveHistoryEntries = function(callback) {
                         // Invert status for EveHome. As EveHome door is a contact sensor, where 1 is contact and 0 is no contact, opposite of what we expect a door to be
                         // ie: 0 = closed, 1 = opened
                         dataStream += util.format(
-                            " 0b %s %s %s %s",
+                            "0b %s %s %s %s",
                             numberToEveHexString(this.EveHome.entry, 8),
                             numberToEveHexString(historyEntry.time - this.EveHome.reftime - EPOCH_OFFSET, 8),
                             this.EveHome.signature2,
@@ -785,26 +1449,39 @@ HomeKitHistory.prototype.__EveHistoryEntries = function(callback) {
                         if ((historyEntry.low && historyEntry.low != 0) && (historyEntry.high && historyEntry.high == 0)) tempTarget = 0;   // cooling limit
                         if ((historyEntry.low && historyEntry.low == 0) && (historyEntry.high && historyEntry.high == 0)) tempTarget = 0;   // off
 
-
                         dataStream += util.format(
-                            " 11 %s %s %s %s %s %s 0000",
+                            "13 %s %s %s %s %s %s %s 0000",
                             numberToEveHexString(this.EveHome.entry, 8),
                             numberToEveHexString(historyEntry.time - this.EveHome.reftime - EPOCH_OFFSET, 8),
                             this.EveHome.signature2,
                             numberToEveHexString(historyEntry.temperature * 100, 4), // temperature
+                            numberToEveHexString(historyEntry.humidity * 100, 4), // Humidity
                             numberToEveHexString(tempTarget * 100, 4), // target temperature for heating
-                            numberToEveHexString(historyEntry.status == 2 ? 100 : 0, 2)); // 0% valve position = off, 100% = heating
+                            numberToEveHexString(historyEntry.status == 2 ? 100 : historyEntry.status == 1 ? 50 : 0, 2)); // 0% valve position = off, 50% = cooling, 100% = heating
+                            //numberToEveHexString(historyEntry.status == 2 ? 100 : 0, 2)); // 0% valve position = off, 100% = heating
                             //numberToEveHexString(historyEntry.status == 2 ? 100 : historyEntry.status == 1 ? 0 : 50, 2)); // 50% valve position = off, 0% = cooling, 100% = heating
                         break;
                     }
 
                     case "energy" : {
                         dataStream += util.format(
-                            " 14 %s %s %s 0000 0000 %s 0000 0000",
+                            "14 %s %s %s 0000 0000 %s 0000 0000",
                             numberToEveHexString(this.EveHome.entry, 8),
                             numberToEveHexString(historyEntry.time - this.EveHome.reftime - EPOCH_OFFSET, 8),
                             this.EveHome.signature2,
                             numberToEveHexString(historyEntry.watts * 10, 4));  // Power in watts
+                        break;
+                    }
+
+                    case "smoke" : {
+                        // TODO - What do we send back??
+                        console.log("smoke history");
+                        break;
+                    }
+                            
+                    case "blind" : {
+                        // TODO - What do we send back??
+                        console.log("blinds history");
                         break;
                     }
                 }
@@ -814,13 +1491,13 @@ HomeKitHistory.prototype.__EveHistoryEntries = function(callback) {
         }
         if (this.EveHome.entry > this.EveHome.count) {
             // No more history data to send back
-            //console.log("DEBUG: __EveHistoryEntries: sent '%s' entries to EveHome ('%s') for '%s:%s'", this.EveHome.send, this.EveHome.evetype, this.EveHome.type, this.EveHome.sub);
+            console.log("DEBUG: __EveHistoryEntries: sent '%s' entries to EveHome ('%s') for '%s:%s'", this.EveHome.send, this.EveHome.evetype, this.EveHome.type, this.EveHome.sub);
             this.EveHome.send = 0;  // no more to send
-            dataStream += " 00";
+            dataStream += "00";
         }
     } else {
          // We're not transferring any data back
-        //console.log("DEBUG: __EveHistoryEntries: do we ever get here.....???", this.EveHome.send, this.EveHome.evetype, this.EveHome.type, this.EveHome.sub, this.EveHome.entry);
+        // console.log("DEBUG: __EveHistoryEntries: do we ever get here.....???", this.EveHome.send, this.EveHome.evetype, this.EveHome.type, this.EveHome.sub, this.EveHome.entry);
         this.EveHome.send = 0;  // no more to send
         dataStream = "00";
     }
@@ -835,14 +1512,14 @@ HomeKitHistory.prototype.__EveHistoryRequest = function(value, callback) {
     }
     this.EveHome.send = (this.EveHome.count - this.EveHome.entry + 1);    // Number of entries we're expected to send
     callback();
-    //console.log("DEBUG: __EveHistoryRequest: requested address", this.EveHome.entry);
+    // console.log("DEBUG: __EveHistoryRequest: requested address", this.EveHome.entry);
 }
 
 HomeKitHistory.prototype.__EveSetTime = function(value, callback) {
     // Time stamp from EveHome
     var timestamp = (EPOCH_OFFSET + EveHexStringToNumber(decodeEveData(value)));
     callback();
-    //console.log("DEBUG: __EveSetTime: timestamp offset", new Date(timeStamp * 1000));
+    // console.log("DEBUG: __EveSetTime: timestamp offset", new Date(timestamp * 1000));
 }
 
 // Eve Reset Total
@@ -998,7 +1675,7 @@ util.inherits(Characteristic.EveVoltage, Characteristic);
 Characteristic.EveVoltage.UUID = "E863F10A-079E-48FF-8F27-9C2605A29F52";
 
 Characteristic.EveElectricCurrent = function () {
-	Characteristic.call(this, "Eve Electric Current", "E863F126-079E-48FF-8F27-9C2605A29F52");
+	Characteristic.call(this, "Eve Current", "E863F126-079E-48FF-8F27-9C2605A29F52");
 	this.setProps({
         format: Characteristic.Formats.FLOAT,
         unit: 'A',
@@ -1045,7 +1722,7 @@ util.inherits(Characteristic.EveGetConfiguration, Characteristic);
 Characteristic.EveGetConfiguration.UUID = "E863F131-079E-48FF-8F27-9C2605A29F52";
 
 Characteristic.EveSetConfiguration = function () {
-	Characteristic.call(this, "Eve Set Confoguration", "E863F11D-079E-48FF-8F27-9C2605A29F52");
+	Characteristic.call(this, "Eve Set Configuration", "E863F11D-079E-48FF-8F27-9C2605A29F52");
 	this.setProps({
         format: Characteristic.Formats.DATA,
         perms: [Characteristic.Perms.WRITE, Characteristic.Perms.HIDDEN]
@@ -1055,16 +1732,16 @@ Characteristic.EveSetConfiguration = function () {
 util.inherits(Characteristic.EveSetConfiguration, Characteristic);
 Characteristic.EveSetConfiguration.UUID = "E863F11D-079E-48FF-8F27-9C2605A29F52";
 
-Characteristic.EveFirmwareInfo = function () {
-	Characteristic.call(this, "Eve Motion Sensitivity", "E863F12C-079E-48FF-8F27-9C2605A29F52");
+Characteristic.EveFirmware = function () {
+	Characteristic.call(this, "Eve Firmware", "E863F11E-079E-48FF-8F27-9C2605A29F52");
 	this.setProps({
         format: Characteristic.Formats.DATA,
         perms: [Characteristic.Perms.READ, Characteristic.Perms.WRITE, Characteristic.Perms.NOTIFY]
 	});
 	this.value = this.getDefaultValue();
 }
-util.inherits(Characteristic.EveFirmwareInfo, Characteristic);
-Characteristic.EveFirmwareInfo.UUID = "E863F12C-079E-48FF-8F27-9C2605A29F52";
+util.inherits(Characteristic.EveFirmware, Characteristic);
+Characteristic.EveFirmware.UUID = "E863F11E-079E-48FF-8F27-9C2605A29F52";
 
 Characteristic.EveSensitivity = function () {
 	Characteristic.call(this, "Eve Motion Sensitivity", "E863F120-079E-48FF-8F27-9C2605A29F52");
@@ -1079,6 +1756,9 @@ Characteristic.EveSensitivity = function () {
 }
 util.inherits(Characteristic.EveSensitivity, Characteristic);
 Characteristic.EveSensitivity.UUID = "E863F120-079E-48FF-8F27-9C2605A29F52";
+Characteristic.EveSensitivity.HIGH = 0
+Characteristic.EveSensitivity.MEDIUM = 4
+Characteristic.EveSensitivity.LOW = 7
 
 Characteristic.EveDuration = function () {
 	Characteristic.call(this, "Eve Motion Duration", "E863F12D-079E-48FF-8F27-9C2605A29F52");
@@ -1094,8 +1774,17 @@ Characteristic.EveDuration = function () {
 util.inherits(Characteristic.EveDuration, Characteristic);
 Characteristic.EveDuration.UUID = "E863F12D-079E-48FF-8F27-9C2605A29F52";
 
-// "E863F122-079E-48FF-8F27-9C2605A29F52" - humidity
-// "E863F108-079E-48FF-8F27-9C2605A29F52" - temperature
+Characteristic.EveDeviceStatus = function () {
+	Characteristic.call(this, "Eve Device Status", "E863F134-079E-48FF-8F27-9C2605A29F52");
+	this.setProps({
+        format: Characteristic.Formats.UINT32,
+        perms: [Characteristic.Perms.READ, Characteristic.Perms.NOTIFY]
+	});
+	this.value = this.getDefaultValue();
+}
+util.inherits(Characteristic.EveDeviceStatus, Characteristic);
+Characteristic.EveDeviceStatus.UUID = "E863F134-079E-48FF-8F27-9C2605A29F52";
+
 
 // EveHomeHistory Service
 Service.EveHomeHistory = function(displayName, subtype) {
