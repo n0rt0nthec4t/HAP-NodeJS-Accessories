@@ -1,3 +1,5 @@
 {
-    "SessionToken" : "<nest session token here"
+    "SessionToken" : "<nest session token here>",
+    "Debug" : false,
+    "HKSV" : true
 }
