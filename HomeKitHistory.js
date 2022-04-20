@@ -5,6 +5,7 @@
 // -- get history to show for motion when attached to a smoke sensor
 // -- get history to show for smoke when attached to a smoke sensor
 // -- thermo schedules/additonal characteris
+// -- Eve Degree/Weather2 history
 //
 // done
 // -- initial support for importing our history into EveHome
@@ -13,8 +14,11 @@
 // -- fixed door history bug with inverted status
 // -- notify Eve when new history entries added
 // -- get humidity recordings for EveHome thermo
+// -- Eve Room2 history returns
+// -- internally check if specified minimun time between entries and if so, ignore logging it
+// -- small correction to number formatting when retreving history for EveHome
 //
-// Version 31/3/2021
+// Version 13/10/2021
 // Mark Hulskamp
 
 const MAX_HISTORY_SIZE = 16384; // 16k entries
@@ -58,9 +62,9 @@ class HomeKitHistory {
 	}
 }
 
-HomeKitHistory.prototype.addHistory = function(service, entry) {
+HomeKitHistory.prototype.addHistory = function(service, entry, timegap) {
     // we'll use the service or characteristic UUID to determine the history entry time and data we'll add
-    // reutil.format the entry object to order the fields consistantly in the output
+    // reformat the entry object to order the fields consistantly in the output
     // Add new history types in the switch statement
     var historyEntry = {};
     if (this.restart != null && typeof entry.restart == "undefined") {
@@ -75,24 +79,27 @@ HomeKitHistory.prototype.addHistory = function(service, entry) {
     if (typeof service.subtype == "undefined") {
         service.subtype = 0;
     }
+    if (typeof timegap == "undefined") {
+        timegap = 0; // Zero minimum time gap between entries
+    }
     switch (service.UUID) {
         case Service.GarageDoorOpener.UUID : {
             // Garage door history
             // entry.time => unix time in seconds
-            // entry.status => 1 = open, 0 = closed
+            // entry.status => 0 = closed, 1 = open
             historyEntry.status = entry.status;
             if (typeof entry.restart != "undefined") historyEntry.restart = entry.restart;
-            this.__addEntry(service.UUID, service.subtype, entry.time, historyEntry);
+            this.__addEntry(service.UUID, service.subtype, entry.time, timegap, historyEntry);
             break;
         }
 
         case Service.MotionSensor.UUID : {
             // Motion sensor history
             // entry.time => unix time in seconds
-            // entry.status => 1 = motion detected, 0 = motion cleared
+            // entry.status => 0 = motion cleared, 1 = motion detected
             historyEntry.status = entry.status;
             if (typeof entry.restart != "undefined") historyEntry.restart = entry.restart;
-            this.__addEntry(service.UUID, service.subtype, entry.time, historyEntry);
+            this.__addEntry(service.UUID, service.subtype, entry.time, timegap, historyEntry);
             break;
         }
 
@@ -100,12 +107,12 @@ HomeKitHistory.prototype.addHistory = function(service, entry) {
         case Service.WindowCovering.UUID : {
             // Window and Window Covering history
             // entry.time => unix time in seconds
-            // entry.status => 1 = open, 0 = closed
+            // entry.status => 0 = closed, 1 = open
             // entry.position => position in % 0% = closed 100% fully open
             historyEntry.status = entry.status;
             historyEntry.position = entry.position;
             if (typeof entry.restart != "undefined") historyEntry.restart = entry.restart;
-            this.__addEntry(service.UUID, service.subtype, entry.time, historyEntry);
+            this.__addEntry(service.UUID, service.subtype, entry.time, timegap, historyEntry);
             break;
         }
 
@@ -122,10 +129,11 @@ HomeKitHistory.prototype.addHistory = function(service, entry) {
             historyEntry.target = entry.target;
             historyEntry.humidity = entry.humidity;
             if (typeof entry.restart != "undefined") historyEntry.restart = entry.restart;
-            this.__addEntry(service.UUID, service.subtype, entry.time, historyEntry);
+            this.__addEntry(service.UUID, service.subtype, entry.time, timegap, historyEntry);
             break;
         }
 
+        case Service.EveAirPressureSensor.UUID :
         case Service.AirQualitySensor.UUID :
         case Service.TemperatureSensor.UUID : {
             // Temperature sensor history
@@ -133,7 +141,8 @@ HomeKitHistory.prototype.addHistory = function(service, entry) {
             // entry.temperature => current temperature in degress C
             // entry.humidity => current humidity
             // optional (entry.ppm)
-            // optional (entry.voc => current VOC measurement in µg/m3)
+            // optional (entry.voc => current VOC measurement in ppb)\
+            // optional (entry.pressure -> in hpa)
             historyEntry.temperature = entry.temperature;
             if (typeof entry.humidity == "undefined") {
                 // fill out humidity if missing
@@ -147,12 +156,17 @@ HomeKitHistory.prototype.addHistory = function(service, entry) {
                 // fill out voc if missing
                 entry.voc = 0;
             }
+            if (typeof entry.pressure == "undefined") {
+                // fill out pressure if missing
+                entry.pressure = 0;
+            }
             historyEntry.temperature = entry.temperature;
             historyEntry.humidity = entry.humidity;
             historyEntry.ppm = entry.ppm;
             historyEntry.voc = entry.voc;
+            historyEntry.pressure = entry.pressure;
             if (typeof entry.restart != "undefined") historyEntry.restart = entry.restart;
-            this.__addEntry(service.UUID, service.subtype, entry.time, historyEntry);
+            this.__addEntry(service.UUID, service.subtype, entry.time, timegap, historyEntry);
             break;
         }
 
@@ -166,7 +180,7 @@ HomeKitHistory.prototype.addHistory = function(service, entry) {
             historyEntry.water = entry.water;
             historyEntry.duration = entry.duration;
             if (typeof entry.restart != "undefined") historyEntry.restart = entry.restart;
-            this.__addEntry(service.UUID, service.subtype, entry.time, historyEntry);
+            this.__addEntry(service.UUID, service.subtype, entry.time, timegap, historyEntry);
             break;
         }
 
@@ -176,7 +190,7 @@ HomeKitHistory.prototype.addHistory = function(service, entry) {
             // entry.level => water level as percentage
             historyEntry.level = entry.level;
             if (typeof entry.restart != "undefined") historyEntry.restart = entry.restart;
-            this.__addEntry(service.UUID, 0, entry.time, historyEntry); // Characteristics dont have sub type, so we'll use 0 as it
+            this.__addEntry(service.UUID, 0, entry.time, timegap, historyEntry); // Characteristics dont have sub type, so we'll use 0 for it
             break;
         }
 
@@ -190,27 +204,27 @@ HomeKitHistory.prototype.addHistory = function(service, entry) {
             historyEntry.volts = entry.volts;
             historyEntry.watts = entry.watts;
             if (typeof entry.restart != "undefined") historyEntry.restart = entry.restart;
-            this.__addEntry(service.UUID, service.subtype, entry.time, historyEntry);
+            this.__addEntry(service.UUID, service.subtype, entry.time, timegap, historyEntry);
             break;
         }
 
         case Service.Doorbell.UUID : {
             // Doorbell press history
             // entry.time => unix time in seconds
-            // entry.status => 1 = doorbell pressed, 0 = not pressed
+            // entry.status => 0 = not pressed, 1 = doorbell pressed
             historyEntry.status = entry.status;
             if (typeof entry.restart != "undefined") historyEntry.restart = entry.restart;
-            this.__addEntry(service.UUID, service.subtype, entry.time, historyEntry);
+            this.__addEntry(service.UUID, service.subtype, entry.time, timegap, historyEntry);
             break;
         }
 
         case Service.SmokeSensor.UUID : {
             // Smoke sensor history
             // entry.time => unix time in seconds
-            // entry.status => 1 = smoke detected, 0 = smoke detected
+            // entry.status => 0 = smoke cleared, 1 = smoke detected
             historyEntry.status = entry.status;
-            if (typeof entry.restart != "undefined") historyEntry.restart = entry.restart;
-            this.__addEntry(service.UUID, service.subtype, entry.time, historyEntry);
+            if (typeof historyEntry.restart != "undefined") historyEntry.restart = entry.restart;
+            this.__addEntry(service.UUID, service.subtype, entry.time, timegap, historyEntry);
             break;
         }
     }
@@ -238,43 +252,55 @@ HomeKitHistory.prototype.rolloverHistory = function() {
     storage.setItem(this.storageKey, this.historyData);
 }
 
-HomeKitHistory.prototype.__addEntry = function(type, sub, time, entry) {
+HomeKitHistory.prototype.__addEntry = function(type, sub, time, timegap, entry) {
     var historyEntry = {};
+    var recordEntry = true; // always record entry unless we dont need to 
     historyEntry.time = time;
     historyEntry.type = type;
     historyEntry.sub = sub;
     Object.entries(entry).forEach(([key, value]) => {
         if (key != "time" || key != "type" || key != "sub") {
-            // Filer out events we want tyo control
+            // Filer out events we want to control
             historyEntry[key] = value;
         }
     });
 
-    // Work out where this goes in the history data array
-    if (this.maxEntries != 0 && this.historyData.next >= this.maxEntries) {
-        // roll over history data as we've reached the defined max entry size
-        this.rolloverHistory();
-    }
-    this.historyData.data[this.historyData.next] = historyEntry;
-    this.historyData.next++;
-
-    // Update types we have in history. This will just be the main type and its latest location in history
-    var typeIndex = this.historyData.types.findIndex(type => (type.type == historyEntry.type && type.sub == historyEntry.sub));
-    if (typeIndex == -1) {
-        this.historyData.types.push({type: historyEntry.type, sub: historyEntry.sub, lastEntry: (this.historyData.next - 1)});
-    } else {
-        this.historyData.types[typeIndex].lastEntry = (this.historyData.next - 1);
-    }
-
-    // Validate types last entries. Helps with rolled over data etc. If we cannot find the type anymore, removed from known types
-    this.historyData.types.forEach((typeEntry, index) => {
-        if (this.historyData.data[typeEntry.lastEntry].type !== typeEntry.type) {
-            // not found, so remove from known types
-            this.historyData.types.splice(index, 1);
+    // If we have a minimum time gap specified, find the last time entry for this type and if less than min gap, ignore
+    if (timegap != 0) {
+        var typeIndex = this.historyData.types.findIndex(type => (type.type == historyEntry.type && type.sub == historyEntry.sub));
+        if (typeIndex >= 0 && (time - this.historyData.data[this.historyData.types[typeIndex].lastEntry].time < timegap) && typeof historyEntry.restart == "undefined") {
+            // time between last recorded entry and this new entry is less than minimum gap specified and its not a "restart" entry, so don't log it
+            recordEntry = false;
         }
-    });
+    }
+  
+    if (recordEntry == true) {
+        // Work out where this goes in the history data array
+        if (this.maxEntries != 0 && this.historyData.next >= this.maxEntries) {
+            // roll over history data as we've reached the defined max entry size
+            this.rolloverHistory();
+        }
+        this.historyData.data[this.historyData.next] = historyEntry;
+        this.historyData.next++;
 
-    storage.setItem(this.storageKey, this.historyData); // Save to persistent storage
+        // Update types we have in history. This will just be the main type and its latest location in history
+        var typeIndex = this.historyData.types.findIndex(type => (type.type == historyEntry.type && type.sub == historyEntry.sub));
+        if (typeIndex == -1) {
+            this.historyData.types.push({type: historyEntry.type, sub: historyEntry.sub, lastEntry: (this.historyData.next - 1)});
+        } else {
+            this.historyData.types[typeIndex].lastEntry = (this.historyData.next - 1);
+        }
+
+        // Validate types last entries. Helps with rolled over data etc. If we cannot find the type anymore, remove from known types
+        this.historyData.types.forEach((typeEntry, index) => {
+            if (this.historyData.data[typeEntry.lastEntry].type !== typeEntry.type) {
+                // not found, so remove from known types
+                this.historyData.types.splice(index, 1);
+            }
+        });
+
+        storage.setItem(this.storageKey, this.historyData); // Save to persistent storage
+    }
 }
 
 HomeKitHistory.prototype.getHistory = function(service, subtype, specifickey) {
@@ -367,7 +393,7 @@ HomeKitHistory.prototype.lastHistory = function(service, subtype) {
 
 HomeKitHistory.prototype.entryCount = function(service, subtype, specifickey) {
     // returns the number of history entries for this service type and subtype
-    // can can also limit to a specific key value
+    // can can also be limited to a specific key value
     var tempHistory = this.getHistory(service, subtype, specifickey);
     return tempHistory.length;
 }
@@ -401,15 +427,17 @@ var decodeEveData = function (data) {
 	return Buffer.from(data, "base64").toString("hex");
 }
 
-// Converts a number into a string for EveHome, including formatting to byte width and reverse byte order
+// Converts a integer number into a string for EveHome, including formatting to byte width and reverse byte order
 // handles upto 64bit values
 var numberToEveHexString = function (number, bytes) {
     if (typeof number != "number") return number;
-    var tempString = "0000000000000000" + number.toString(16);
+    var tempString = "0000000000000000" + Math.floor(number).toString(16);
     tempString = tempString.slice(-1 * bytes).match(/[a-fA-F0-9]{2}/g).reverse().join('');
     return tempString;
 }
 
+// Converts a float number into a string for EveHome, including formatting to byte width and reverse byte order
+// handles upto 64bit values
 var floatToEveHexString = function (number, bytes) {
     if (typeof number != "number") return number;
     var buf = Buffer.allocUnsafe(4);
@@ -648,7 +676,7 @@ HomeKitHistory.prototype.linkToEveHome = function(HomeKitAccessory, service, opt
                     //          c7 = not attached
                     // 19 - vacation mode
                     //          00ff - off
-                    //          01 + "away temp" - enabled with temp
+                    //          01 + "away temp" - enabled with vacation temp
                     // f4 - temperatures
                     // fa - programs for week
                     // 1a - default day program
@@ -857,6 +885,19 @@ HomeKitHistory.prototype.linkToEveHome = function(HomeKitAccessory, service, opt
                 break;
             }
 
+            case Service.EveAirPressureSensor.UUID : {
+                // treat these as EveHome Weather (2015)
+                var historyService = HomeKitAccessory.addService(Service.EveHomeHistory, "", 1);
+                var tempHistory = this.getHistory(service.UUID, service.subtype);
+                var historyreftime = (tempHistory.length == 0 ? (this.historyData.reset - EPOCH_OFFSET) : (tempHistory[0].time - EPOCH_OFFSET));
+
+                service.addCharacteristic(Characteristic.EveFirmware);
+                service.getCharacteristic(Characteristic.EveFirmware).updateValue(encodeEveData(util.format("01 %s be", numberToEveHexString(809, 4))));  // firmware version (build xxxx)));
+
+                this.EveHome = {service: historyService, linkedservice: service, type: service.UUID, sub: service.subtype, evetype: "weather", signature1: "03 0102 0202 0302", signature2: "07", entry: 0, count: tempHistory.length, reftime: historyreftime, send: 0};
+                break;
+            }
+
             case Service.AirQualitySensor.UUID :
             case Service.TemperatureSensor.UUID : {
                 // treat these as EveHome Room(s)
@@ -868,10 +909,13 @@ HomeKitHistory.prototype.linkToEveHome = function(HomeKitAccessory, service, opt
 
                 if (service.UUID == Service.AirQualitySensor.UUID) {
                     // Eve Room 2 (2018)
-                    service.getCharacteristic(Characteristic.EveFirmware).updateValue(encodeEveData(util.format("27 %s be", numberToEveHexString(1151, 4))));  // firmware version (build xxxx)));
+                    service.getCharacteristic(Characteristic.EveFirmware).updateValue(encodeEveData(util.format("27 %s be", numberToEveHexString(1416, 4))));  // firmware version (build xxxx)));
 
                     this.EveHome = {service: historyService, linkedservice: service, type: service.UUID, sub: service.subtype, evetype: "room2", signature1: "07 0102 0202 2202 2901 2501 2302 2801", signature2: "7f", entry: 0, count: tempHistory.length, reftime: historyreftime, send: 0};
                     if (service.testCharacteristic(Characteristic.VOCDensity) == false) service.addCharacteristic(Characteristic.VOCDensity);
+
+                    // Need to ensure HomeKit accessory which has Air Quality service also has temperature & humidity services.
+                    // Temperature service needs characteristic Characteristic.TemperatureDisplayUnits set to Characteristic.TemperatureDisplayUnits.CELSIUS
                 }
 
                 if (service.UUID == Service.TemperatureSensor.UUID) {
@@ -879,10 +923,9 @@ HomeKitHistory.prototype.linkToEveHome = function(HomeKitAccessory, service, opt
                     service.getCharacteristic(Characteristic.EveFirmware).updateValue(encodeEveData(util.format("02 %s be", numberToEveHexString(1151, 4))));  // firmware version (build xxxx)));
 
                     this.EveHome = {service: historyService, linkedservice: service, type: service.UUID, sub: service.subtype, evetype: "room", signature1: "04 0102 0202 0402 0f03", signature2: "1f", entry: 0, count: tempHistory.length, reftime: historyreftime, send: 0};
+                    if (service.testCharacteristic(Characteristic.TemperatureDisplayUnits) == false) service.addCharacteristic(Characteristic.TemperatureDisplayUnits); // Needed to show history for temperature
+                    service.getCharacteristic(Characteristic.TemperatureDisplayUnits).updateValue(Characteristic.TemperatureDisplayUnits.CELSIUS);  // Temperature needs to be in Celsius
                 }
-
-                if (service.testCharacteristic(Characteristic.TemperatureDisplayUnits) == false) service.addCharacteristic(Characteristic.TemperatureDisplayUnits); // Needed to show history for temperature
-                service.getCharacteristic(Characteristic.TemperatureDisplayUnits).updateValue(Characteristic.TemperatureDisplayUnits.CELSIUS);  // Temperature needs to be in Celsius
                 break;
             }
 
@@ -896,11 +939,14 @@ HomeKitHistory.prototype.linkToEveHome = function(HomeKitAccessory, service, opt
                 this.__EveMotionPersist = {};
                 this.__EveMotionPersist.duration = optionalParams.hasOwnProperty("EveMotion_duration") ? optionalParams.EveMotion_duration : 5; // default 5 seconds
                 this.__EveMotionPersist.sensitivity = optionalParams.hasOwnProperty("EveMotion_sensitivity") ? optionalParams.EveMotion_sensivity : Characteristic.EveSensitivity.HIGH; // default sensitivity
+                this.__EveMotionPersist.ledmotion = optionalParams.hasOwnProperty("EveMotion_ledmotion") ? optionalParams.EveMotion_ledmotion: false; // off
 
                 this.EveHome = {service: historyService, linkedservice: service, type: service.UUID, sub: service.subtype, evetype: "motion", signature1:"02 1301 1c01", signature2: "02", entry: 0, count: tempHistory.length, reftime: historyreftime, send: 0};
                 service.addCharacteristic(Characteristic.EveSensitivity);
                 service.addCharacteristic(Characteristic.EveDuration);
                 service.addCharacteristic(Characteristic.EveLastActivation);
+                //service.addCharacteristic(Characteristic.EveGetConfiguration);
+                //service.addCharacteristic(Characteristic.EveSetConfiguration);
 
                 // Setup initial values and callbacks for charateristics we are using
                 service.getCharacteristic(Characteristic.EveLastActivation).updateValue(this.__EveLastEventTime()); // time of last event in seconds since first event
@@ -908,7 +954,7 @@ HomeKitHistory.prototype.linkToEveHome = function(HomeKitAccessory, service, opt
                     callback(null, this.__EveLastEventTime());  // time of last event in seconds since first event
                 });
 
-                service.getCharacteristic(Characteristic.EveSensitivity).update(this.__EveMotionPersist.sensitivity);
+                service.getCharacteristic(Characteristic.EveSensitivity).updateValue(this.__EveMotionPersist.sensitivity);
                 service.getCharacteristic(Characteristic.EveSensitivity).on("get", (callback) => {
                     callback(null, this.__EveMotionPersist.sensitivity);
                 });
@@ -917,7 +963,7 @@ HomeKitHistory.prototype.linkToEveHome = function(HomeKitAccessory, service, opt
                     callback();
                 });
 
-                service.getCharacteristic(Characteristic.EveDuration).update(this.__EveMotionPersist.duration);
+                service.getCharacteristic(Characteristic.EveDuration).updateValue(this.__EveMotionPersist.duration);
                 service.getCharacteristic(Characteristic.EveDuration).on("get", (callback) => {
                     callback(null, this.__EveMotionPersist.duration);
                 });
@@ -925,6 +971,48 @@ HomeKitHistory.prototype.linkToEveHome = function(HomeKitAccessory, service, opt
                     this.__EveMotionPersist.duration = value; 
                     callback();
                 });
+
+                /*service.getCharacteristic(Characteristic.EveGetConfiguration).updateValue(encodeEveData("300100"));
+                service.getCharacteristic(Characteristic.EveGetConfiguration).on("get", (callback) => {
+                    var value = util.format(
+                        "0002 2500 0302 %s 9b04 %s 8002 ffff 1e02 2500 0c",
+                        numberToEveHexString(1144, 4),  // firmware version (build xxxx)
+                        numberToEveHexString(Math.floor(new Date() / 1000), 8), // "now" time
+                       );    // Not sure why 64bit value???
+       
+                    console.log("Motion set", value)
+          
+                    callback(null, encodeEveData(value));
+                });
+                service.getCharacteristic(Characteristic.EveSetConfiguration).on("set", (value, callback) => {
+                    var valHex = decodeEveData(value);
+                    var index = 0;
+                    while (index < valHex.length) {
+                        // first byte is command in this data stream
+                        // second byte is size of data for command
+                        command = valHex.substr(index, 2);
+                        size = parseInt(valHex.substr(index + 2, 2), 16) * 2;
+                        data = valHex.substr(index + 4, parseInt(valHex.substr(index + 2, 2), 16) * 2);
+                        switch(command) {
+                            case "30" : {
+                                this.__EveMotionPersist.ledmotion = (data == "01" ? true : false);
+                                break;
+                            }
+
+                            case "80" : {
+                                //0000 0400 (mostly) and sometimes 300103 and 80040000 ffff
+                                break;
+                            }
+
+                            default : {
+                                console.log("DEBUG: Unknown Eve Motion command '%s' with data '%s'", command, data);
+                                break;
+                            }
+                        }
+                        index += (4 + size);  // Move to next command accounting for header size of 4 bytes
+                    }
+                    callback();
+                }); */
                 break;
             }
 
@@ -936,7 +1024,7 @@ HomeKitHistory.prototype.linkToEveHome = function(HomeKitAccessory, service, opt
                 // TODO = work out what the "signatures" need to be for an Eve Smoke
                 // Also, how to make alarm test button active in Eve app and not say "not correctly mounted"
            
-                this.EveHome = {service: historyService, linkedservice: service, type: service.UUID, sub: service.subtype, evetype: "smoke", signature1: "04 0f01 1601 1b08 2202", signature2: "1f", entry: 0, count: tempHistory.length, reftime: historyreftime, send: 0};
+                this.EveHome = {service: historyService, linkedservice: service, type: service.UUID, sub: service.subtype, evetype: "smoke", signature1: "04 1601 1b04 0f03 2302", signature2: "0f", entry: 0, count: tempHistory.length, reftime: historyreftime, send: 0};
 
                 // Need some internal storage to track Eve Smoke configuration from EveHome app
                 this.__EveSmokePersist = {};
@@ -1026,7 +1114,7 @@ HomeKitHistory.prototype.linkToEveHome = function(HomeKitAccessory, service, opt
                 var tempHistory = this.getHistory(Service.Valve.UUID, (service.UUID == Service.IrrigationSystem.UUID ? null : service.subtype));
                 var historyreftime = (tempHistory.length == 0 ? (this.historyData.reset - EPOCH_OFFSET) : (tempHistory[0].time - EPOCH_OFFSET));
   
-                this.EveHome = {service: historyService, linkedservice: service, type: Service.Valve.UUID, sub: (service.UUID == Service.IrrigationSystem.UUID ? null : service.subtype), evetype: "aqua", signature1: "03 1f01 2a08 2302", signature2: "05", signature3: "07", entry: 0, count: tempHistory.length, reftime: historyreftime, send: 0};
+                this.EveHome = {service: historyService, linkedservice: service, type: Service.Valve.UUID, sub: (service.UUID == Service.IrrigationSystem.UUID ? null : service.subtype), evetype: "aqua", signature1: "03 1f01 2a08 2302", signature2: "07", entry: 0, count: tempHistory.length, reftime: historyreftime, send: 0};
                 service.addCharacteristic(Characteristic.EveGetConfiguration);
                 service.addCharacteristic(Characteristic.EveSetConfiguration);
                 if (service.testCharacteristic(Characteristic.LockPhysicalControls) == false) service.addCharacteristic(Characteristic.LockPhysicalControls); // Allows childlock toggle to be displayed in Eve App
@@ -1200,11 +1288,12 @@ HomeKitHistory.prototype.linkToEveHome = function(HomeKitAccessory, service, opt
 
             case Service.Outlet.UUID : {
                 // treat these as EveHome energy
+                // TODO - schedules
                 var historyService = HomeKitAccessory.addService(Service.EveHomeHistory, "", 1);  
                 var tempHistory = this.getHistory(service.UUID, service.subtype);
                 var historyreftime = (tempHistory.length == 0 ? (this.historyData.reset - EPOCH_OFFSET) : (tempHistory[0].time - EPOCH_OFFSET));
-
-                this.EveHome = {service: historyService, linkedservice: service, type: service.UUID, sub: service.subtype, evetype: "energy", signature1: "04 0102 0202 0702 0f03", signature2: "1f", entry: 0, count: tempHistory.length, reftime: historyreftime, send: 0}; 
+        
+                this.EveHome = {service: historyService, linkedservice: service, type: service.UUID, sub: service.subtype, evetype: "energy", signature1: "02 0702 0e01", signature2: "03", entry: 0, count: tempHistory.length, reftime: historyreftime, send: 0}; 
                 service.addCharacteristic(Characteristic.EveVoltage);
                 service.addCharacteristic(Characteristic.EveElectricCurrent);
                 service.addCharacteristic(Characteristic.EveCurrentConsumption);
@@ -1212,7 +1301,6 @@ HomeKitHistory.prototype.linkToEveHome = function(HomeKitAccessory, service, opt
 
                 // Setup initial values and callbacks for charateristics we are using
                 service.getCharacteristic(Characteristic.EveCurrentConsumption).updateValue(this.__EveEnergyCurrentPower());
-
                 service.getCharacteristic(Characteristic.EveCurrentConsumption).on("get", (callback) => {
                     callback(null, this.__EveEnergyCurrentPower());
                 });
@@ -1371,19 +1459,28 @@ HomeKitHistory.prototype.__EveHistoryEntries = function(callback) {
                 historyEntry = tempHistory[this.EveHome.entry - 1]; // need to map EveHome entry address to our data history, as EvenHome addreses start at 1
                 switch (this.EveHome.evetype) {
                     case "aqua" : {
+                        // 1f01 2a08 2302
+                        // 1f - InUse
+                        // 2a - Water Usage (ml)
+                        // 23 - Battery millivolts
                         dataStream += util.format(
-                            "15 %s %s %s %s %s 300c",
+                            "15 %s %s %s %s %s 300c",   // 300c is battery level in millivolts = 3120mv, which think should be 100% for an eve aqua running on 2 x AAs??
                             numberToEveHexString(this.EveHome.entry, 8),
                             numberToEveHexString(historyEntry.time - this.EveHome.reftime - EPOCH_OFFSET, 8),
-                            this.EveHome.signature3,
+                            this.EveHome.signature2,
                             numberToEveHexString(historyEntry.status, 2),
                             numberToEveHexString(historyEntry.status == 1 ? 0 : Math.floor(parseFloat(historyEntry.water) * 1000), 16)); // in millilitres (64bit value)
                         break;
                     }
 
                     case "room" : {
+                        // 0102 0202 0402 0f03
+                        // 01 - Temperature
+                        // 02 - Humidity
+                        // 04 - Air Quality (ppm)
+                        // 0f - VOC Heat Sense??
                         dataStream += util.format(
-                            "13 %s %s %s %s %s %s 0000 00",
+                            "13 %s %s %s %s %s %s 000000",
                             numberToEveHexString(this.EveHome.entry, 8),
                             numberToEveHexString(historyEntry.time - this.EveHome.reftime - EPOCH_OFFSET, 8),
                             this.EveHome.signature2,
@@ -1394,18 +1491,33 @@ HomeKitHistory.prototype.__EveHistoryEntries = function(callback) {
                     }
 
                     case "room2" : {
+                        // 0102 0202 2202 2901 2501 2302 2801
+                        // 01 - Temperature
+                        // 02 - Humidity
+                        // 22 - VOC Density (ppb)
+                        // 29 - ??
+                        // 25 - Battery level %
+                        // 23 - Battery millivolts
+                        // 28 - ??
                         dataStream += util.format(
-                            "15 %s %s %s %s %s %s 0054 a80f01",
+                            //"15 %s %s %s %s %s %s 00 54 a80f 01",    // 54 = battery % = 84 a80f = battery = 4008mv
+                            "15 %s %s %s %s %s %s 00 %s %s 01",    // 64 = battery % = 100 a312 = battery = 4771mv
                             numberToEveHexString(this.EveHome.entry, 8),
                             numberToEveHexString(historyEntry.time - this.EveHome.reftime - EPOCH_OFFSET, 8),
                             this.EveHome.signature2,
                             numberToEveHexString(historyEntry.temperature * 100, 4), // temperature
                             numberToEveHexString(historyEntry.humidity * 100, 4), // Humidity
-                            numberToEveHexString(historyEntry.hasOwnProperty("voc") ? historyEntry.voc : 0, 4)); // VOC - air quality
+                            numberToEveHexString(historyEntry.hasOwnProperty("voc") ? historyEntry.voc : 0, 4), // VOC - air quality in ppm
+                            numberToEveHexString(100, 2), // battery level % - 100%
+                            numberToEveHexString(4771, 4)); // battery millivolts - 4771mv
                         break;
                     }
 
                     case "weather" : {
+                        // 0102 0202 0302
+                        // 01 - Temperature
+                        // 02 - Humidity
+                        // 03 - Air Pressure
                         dataStream += util.format(
                             "10 %s %s %s %s %s %s",
                             numberToEveHexString(this.EveHome.entry, 8),
@@ -1417,7 +1529,19 @@ HomeKitHistory.prototype.__EveHistoryEntries = function(callback) {
                         break;
                     }
 
-                    case "motion" : 
+                    case "motion" : {
+                        // 1301 1c01
+                        // 13 - Motion detected
+                        // 1c - Motion currently active??
+                        dataStream += util.format(
+                            "0b %s %s %s %s",
+                            numberToEveHexString(this.EveHome.entry, 8),
+                            numberToEveHexString(historyEntry.time - this.EveHome.reftime - EPOCH_OFFSET, 8),
+                            this.EveHome.signature2,
+                            numberToEveHexString(historyEntry.status, 2));
+                        break;
+                    }
+
                     case "contact" : 
                     case "switch" : {
                         // contact, motion and switch sensors treated the same for status
@@ -1433,6 +1557,8 @@ HomeKitHistory.prototype.__EveHistoryEntries = function(callback) {
                     case "door" : {
                         // Invert status for EveHome. As EveHome door is a contact sensor, where 1 is contact and 0 is no contact, opposite of what we expect a door to be
                         // ie: 0 = closed, 1 = opened
+                        // 0601
+                        // 06 - Contact status 0 = no contact, 1 = contact
                         dataStream += util.format(
                             "0b %s %s %s %s",
                             numberToEveHexString(this.EveHome.entry, 8),
@@ -1443,6 +1569,13 @@ HomeKitHistory.prototype.__EveHistoryEntries = function(callback) {
                     }
 
                     case "thermo" : {
+                        // 0102 0202 1102 1001 1201 1d01
+                        // 01 - Temperature
+                        // 02 - Humidity
+                        // 11 - Target Temperature
+                        // 10 - Valve percentage
+                        // 12 - Thermo target
+                        // 1d - Open window
                         var tempTarget = 0;
                         if ((historyEntry.low && historyEntry.low == 0) && (historyEntry.high && historyEntry.high != 0)) tempTarget = historyEntry.target.high;   // heating limit
                         if ((historyEntry.low && historyEntry.low != 0) && (historyEntry.high && historyEntry.high != 0)) tempTarget = historyEntry.target.high;   // range, so using heating limit
@@ -1450,7 +1583,7 @@ HomeKitHistory.prototype.__EveHistoryEntries = function(callback) {
                         if ((historyEntry.low && historyEntry.low == 0) && (historyEntry.high && historyEntry.high == 0)) tempTarget = 0;   // off
 
                         dataStream += util.format(
-                            "13 %s %s %s %s %s %s %s 0000",
+                            "13 %s %s %s %s %s %s %s 00 00",
                             numberToEveHexString(this.EveHome.entry, 8),
                             numberToEveHexString(historyEntry.time - this.EveHome.reftime - EPOCH_OFFSET, 8),
                             this.EveHome.signature2,
@@ -1458,18 +1591,20 @@ HomeKitHistory.prototype.__EveHistoryEntries = function(callback) {
                             numberToEveHexString(historyEntry.humidity * 100, 4), // Humidity
                             numberToEveHexString(tempTarget * 100, 4), // target temperature for heating
                             numberToEveHexString(historyEntry.status == 2 ? 100 : historyEntry.status == 1 ? 50 : 0, 2)); // 0% valve position = off, 50% = cooling, 100% = heating
-                            //numberToEveHexString(historyEntry.status == 2 ? 100 : 0, 2)); // 0% valve position = off, 100% = heating
-                            //numberToEveHexString(historyEntry.status == 2 ? 100 : historyEntry.status == 1 ? 0 : 50, 2)); // 50% valve position = off, 0% = cooling, 100% = heating
                         break;
                     }
 
                     case "energy" : {
+                        // 0702 0e01
+                        // 07 - Power10thWh
+                        // 0e - on/off
                         dataStream += util.format(
-                            "14 %s %s %s 0000 0000 %s 0000 0000",
+                            "0c %s %s %s %s %s",
                             numberToEveHexString(this.EveHome.entry, 8),
                             numberToEveHexString(historyEntry.time - this.EveHome.reftime - EPOCH_OFFSET, 8),
                             this.EveHome.signature2,
-                            numberToEveHexString(historyEntry.watts * 10, 4));  // Power in watts
+                            numberToEveHexString(historyEntry.watts * 10, 4),   // Power in watts
+                            numberToEveHexString(historyEntry.status, 2));  // Power status, 1 = on, 0 = off
                         break;
                     }
 
@@ -1491,7 +1626,7 @@ HomeKitHistory.prototype.__EveHistoryEntries = function(callback) {
         }
         if (this.EveHome.entry > this.EveHome.count) {
             // No more history data to send back
-            console.log("DEBUG: __EveHistoryEntries: sent '%s' entries to EveHome ('%s') for '%s:%s'", this.EveHome.send, this.EveHome.evetype, this.EveHome.type, this.EveHome.sub);
+            // console.log("DEBUG: __EveHistoryEntries: sent '%s' entries to EveHome ('%s') for '%s:%s'", this.EveHome.send, this.EveHome.evetype, this.EveHome.type, this.EveHome.sub);
             this.EveHome.send = 0;  // no more to send
             dataStream += "00";
         }
@@ -1785,6 +1920,35 @@ Characteristic.EveDeviceStatus = function () {
 util.inherits(Characteristic.EveDeviceStatus, Characteristic);
 Characteristic.EveDeviceStatus.UUID = "E863F134-079E-48FF-8F27-9C2605A29F52";
 
+Characteristic.EveAirPressure = function () {
+	Characteristic.call(this, "Eve Air Pressure", "E863F10F-079E-48FF-8F27-9C2605A29F52");
+	this.setProps({
+        format: Characteristic.Formats.UINT16,
+        perms: [Characteristic.Perms.READ, Characteristic.Perms.NOTIFY],
+        unit: 'hPa',
+        minValue: 700,
+        maxValue: 1100,
+	});
+	this.value = this.getDefaultValue();
+}
+util.inherits(Characteristic.EveAirPressure, Characteristic);
+Characteristic.EveAirPressure.UUID = "E863F10F-079E-48FF-8F27-9C2605A29F52";
+
+Characteristic.EveElevation = function () {
+	Characteristic.call(this, "Eve Elevation", "E863F130-079E-48FF-8F27-9C2605A29F52");
+	this.setProps({
+        format: Characteristic.Formats.INT,
+        perms: [Characteristic.Perms.READ, Characteristic.Perms.WRITE, Characteristic.Perms.NOTIFY],
+        unit: 'm',
+        minValue: -430,
+        maxValue: 8850,
+        minStep: 10,
+	});
+	this.value = this.getDefaultValue();
+}
+util.inherits(Characteristic.EveElevation, Characteristic);
+Characteristic.EveElevation.UUID = "E863F130-079E-48FF-8F27-9C2605A29F52";
+
 
 // EveHomeHistory Service
 Service.EveHomeHistory = function(displayName, subtype) {
@@ -1799,5 +1963,316 @@ Service.EveHomeHistory = function(displayName, subtype) {
 }
 util.inherits(Service.EveHomeHistory, Service);
 Service.EveHomeHistory.UUID = "E863F007-079E-48FF-8F27-9C2605A29F52";
+
+// Eve custom air pressure service
+Service.EveAirPressureSensor = function(displayName, subtype) {
+	Service.call(this, displayName, "E863F00A-079E-48FF-8F27-9C2605A29F52", subtype);
+
+    // Required Characteristics
+    this.addCharacteristic(Characteristic.EveAirPressure);
+    this.addCharacteristic(Characteristic.EveElevation);
+}
+util.inherits(Service.EveAirPressureSensor, Service);
+Service.EveAirPressureSensor.UUID = "E863F00A-079E-48FF-8F27-9C2605A29F52";
+
+
+// Other UUIDs Eve Home recognises
+Characteristic.ApparentTemperature = function () {
+	Characteristic.call(this, "ApparentTemperature", "C1283352-3D12-4777-ACD5-4734760F1AC8");
+	this.setProps({
+        format: Characteristic.Formats.FLOAT,
+        perms: [Characteristic.Perms.READ, Characteristic.Perms.NOTIFY],
+        unit: Characteristic.Units.CELSIUS,
+        minValue: -40,
+        maxValue: 100,
+        minStep: 0.1
+	});
+	this.value = this.getDefaultValue();
+}
+util.inherits(Characteristic.ApparentTemperature, Characteristic);
+Characteristic.ApparentTemperature.UUID = "C1283352-3D12-4777-ACD5-4734760F1AC8";
+
+Characteristic.CloudCover = function () {
+	Characteristic.call(this, "Cloud Cover", "64392FED-1401-4F7A-9ADB-1710DD6E3897");
+	this.setProps({
+        format: Characteristic.Formats.UINT8,
+        perms: [Characteristic.Perms.READ, Characteristic.Perms.NOTIFY],
+        unit: Characteristic.Units.PERCENTAGE,
+        minValue: 0,
+        maxValue: 100
+	});
+	this.value = this.getDefaultValue();
+}
+util.inherits(Characteristic.CloudCover, Characteristic);
+Characteristic.CloudCover.UUID = "64392FED-1401-4F7A-9ADB-1710DD6E3897";
+
+Characteristic.Condition = function () {
+	Characteristic.call(this, "Condition", "CD65A9AB-85AD-494A-B2BD-2F380084134D");
+	this.setProps({
+        format: Characteristic.Formats.STRING,
+        perms: [Characteristic.Perms.READ, Characteristic.Perms.NOTIFY]
+	});
+	this.value = this.getDefaultValue();
+}
+util.inherits(Characteristic.Condition, Characteristic);
+Characteristic.Condition.UUID = "CD65A9AB-85AD-494A-B2BD-2F380084134D";
+
+Characteristic.ConditionCategory = function () {
+	Characteristic.call(this, "Condition Category", "CD65A9AB-85AD-494A-B2BD-2F380084134C");
+	this.setProps({
+        format: Characteristic.Formats.UINT8,
+        perms: [Characteristic.Perms.READ, Characteristic.Perms.NOTIFY],
+        minValue: 0,
+        maxValue: 9
+	});
+	this.value = this.getDefaultValue();
+}
+util.inherits(Characteristic.ConditionCategory, Characteristic);
+Characteristic.ConditionCategory.UUID = "CD65A9AB-85AD-494A-B2BD-2F380084134C";
+
+Characteristic.DewPoint = function () {
+	Characteristic.call(this, "Dew Point", "095C46E2-278E-4E3C-B9E7-364622A0F501");
+	this.setProps({
+        format: Characteristic.Formats.FLOAT,
+        perms: [Characteristic.Perms.READ, Characteristic.Perms.NOTIFY],
+        unit: Characteristic.Units.CELSIUS,
+        minValue: -40,
+        maxValue: 100,
+        minStep: 0.1
+	});
+	this.value = this.getDefaultValue();
+}
+util.inherits(Characteristic.DewPoint, Characteristic);
+Characteristic.DewPoint.UUID = "095C46E2-278E-4E3C-B9E7-364622A0F501";
+
+Characteristic.ForecastDay = function () {
+	Characteristic.call(this, "Day", "57F1D4B2-0E7E-4307-95B5-808750E2C1C7");
+	this.setProps({
+        format: Characteristic.Formats.STRING,
+        perms: [Characteristic.Perms.READ, Characteristic.Perms.NOTIFY]
+	});
+	this.value = this.getDefaultValue();
+}
+util.inherits(Characteristic.ForecastDay, Characteristic);
+Characteristic.ForecastDay.UUID = "57F1D4B2-0E7E-4307-95B5-808750E2C1C7";
+
+Characteristic.MaximumWindSpeed = function () {
+	Characteristic.call(this, "Maximum Wind Speed", "6B8861E5-D6F3-425C-83B6-069945FFD1F1");
+	this.setProps({
+        format: Characteristic.Formats.FLOAT,
+        perms: [Characteristic.Perms.READ, Characteristic.Perms.NOTIFY],
+        unit: "km/h",
+        minValue: 0,
+        maxValue: 150,
+        minStep: 0.1
+	});
+	this.value = this.getDefaultValue();
+}
+util.inherits(Characteristic.MaximumWindSpeed, Characteristic);
+Characteristic.MaximumWindSpeed.UUID = "6B8861E5-D6F3-425C-83B6-069945FFD1F1";
+
+Characteristic.MinimumTemperature = function () {
+	Characteristic.call(this, "Minimum Temperature", "707B78CA-51AB-4DC9-8630-80A58F07E41");
+	this.setProps({
+        format: Characteristic.Formats.FLOAT,
+        perms: [Characteristic.Perms.READ, Characteristic.Perms.NOTIFY],
+        unit: Characteristic.Units.CELSIUS,
+        minValue: -40,
+        maxValue: 100,
+        minStep: 0.1
+	});
+	this.value = this.getDefaultValue();
+}
+util.inherits(Characteristic.MinimumTemperature, Characteristic);
+Characteristic.MinimumTemperature.UUID = "707B78CA-51AB-4DC9-8630-80A58F07E41";
+
+Characteristic.ObservationStation = function () {
+	Characteristic.call(this, "Observation Station", "D1B2787D-1FC4-4345-A20E-7B5A74D693ED");
+	this.setProps({
+        format: Characteristic.Formats.STRING,
+        perms: [Characteristic.Perms.READ, Characteristic.Perms.NOTIFY]
+	});
+	this.value = this.getDefaultValue();
+}
+util.inherits(Characteristic.ObservationStation, Characteristic);
+Characteristic.ObservationStation.UUID = "D1B2787D-1FC4-4345-A20E-7B5A74D693ED";
+
+Characteristic.ObservationTime = function () {
+	Characteristic.call(this, "Observation Time", "234FD9F1-1D33-4128-B622-D052F0C402AF");
+	this.setProps({
+        format: Characteristic.Formats.STRING,
+        perms: [Characteristic.Perms.READ, Characteristic.Perms.NOTIFY]
+	});
+	this.value = this.getDefaultValue();
+}
+util.inherits(Characteristic.ObservationTime, Characteristic);
+Characteristic.ObservationTime.UUID = "234FD9F1-1D33-4128-B622-D052F0C402AF";
+
+Characteristic.Ozone = function () {
+	Characteristic.call(this, "Ozone", "BBEFFDDD-1BCD-4D75-B7CD-B57A90A04D13");
+	this.setProps({
+        format: Characteristic.Formats.UINT8,
+        perms: [Characteristic.Perms.READ, Characteristic.Perms.NOTIFY],
+        unit: "DU",
+        minValue: 0,
+        maxValue: 500
+	});
+	this.value = this.getDefaultValue();
+}
+util.inherits(Characteristic.Ozone, Characteristic);
+Characteristic.Ozone.UUID = "BBEFFDDD-1BCD-4D75-B7CD-B57A90A04D13";
+
+Characteristic.Rain = function () {
+	Characteristic.call(this, "Rain", "F14EB1AD-E000-4EF4-A54F-0CF07B2E7BE7");
+	this.setProps({
+        format: Characteristic.Formats.BOOL,
+        perms: [Characteristic.Perms.READ, Characteristic.Perms.NOTIFY]
+	});
+	this.value = this.getDefaultValue();
+}
+util.inherits(Characteristic.Rain, Characteristic);
+Characteristic.Rain.UUID = "F14EB1AD-E000-4EF4-A54F-0CF07B2E7BE7";
+
+Characteristic.RainLastHour = function () {
+	Characteristic.call(this, "Rain Last Hour", "10C88F40-7EC4-478C-8D5A-BD0C3CCE14B7");
+	this.setProps({
+        format: Characteristic.Formats.UINT16,
+        perms: [Characteristic.Perms.READ, Characteristic.Perms.NOTIFY],
+        unit: "mm",
+        minValue: 0,
+        maxValue: 200
+	});
+	this.value = this.getDefaultValue();
+}
+util.inherits(Characteristic.RainLastHour, Characteristic);
+Characteristic.RainLastHour.UUID = "10C88F40-7EC4-478C-8D5A-BD0C3CCE14B7";
+
+Characteristic.TotalRain = function () {
+	Characteristic.call(this, "Total Rain", "CCC04890-565B-4376-B39A-3113341D9E0F");
+	this.setProps({
+        format: Characteristic.Formats.UINT16,
+        perms: [Characteristic.Perms.READ, Characteristic.Perms.NOTIFY],
+        unit: "mm",
+        minValue: 0,
+        maxValue: 2000
+	});
+	this.value = this.getDefaultValue();
+}
+util.inherits(Characteristic.TotalRain, Characteristic);
+Characteristic.TotalRain.UUID = "CCC04890-565B-4376-B39A-3113341D9E0F";
+
+Characteristic.RainProbability = function () {
+	Characteristic.call(this, "Rain Probability", "FC01B24F-CF7E-4A74-90DB-1B427AF1FFA3");
+	this.setProps({
+        format: Characteristic.Formats.UINT8,
+        perms: [Characteristic.Perms.READ, Characteristic.Perms.NOTIFY],
+        unit: Characteristic.Units.PERCENTAGE,
+        minValue: 0,
+        maxValue: 100
+	});
+	this.value = this.getDefaultValue();
+}
+util.inherits(Characteristic.RainProbability, Characteristic);
+Characteristic.RainProbability.UUID = "FC01B24F-CF7E-4A74-90DB-1B427AF1FFA3";
+
+Characteristic.Snow = function () {
+	Characteristic.call(this, "Snow", "F14EB1AD-E000-4CE6-BD0E-384F9EC4D5DD");
+	this.setProps({
+        format: Characteristic.Formats.BOOL,
+        perms: [Characteristic.Perms.READ, Characteristic.Perms.NOTIFY]
+	});
+	this.value = this.getDefaultValue();
+}
+util.inherits(Characteristic.Snow, Characteristic);
+Characteristic.Snow.UUID = "F14EB1AD-E000-4CE6-BD0E-384F9EC4D5DD";
+
+Characteristic.SolarRadiation = function () {
+	Characteristic.call(this, "Solar Radiation", "1819A23E-ECAB-4D39-B29A-7364D299310B");
+	this.setProps({
+        format: Characteristic.Formats.UINT16,
+        perms: [Characteristic.Perms.READ, Characteristic.Perms.NOTIFY],
+        unit: "W/m²",
+        minValue: 0,
+        maxValue: 2000
+	});
+	this.value = this.getDefaultValue();
+}
+util.inherits(Characteristic.SolarRadiation, Characteristic);
+Characteristic.SolarRadiation.UUID = "1819A23E-ECAB-4D39-B29A-7364D299310B";
+
+Characteristic.SunriseTime = function () {
+	Characteristic.call(this, "Sunrise", "0D96F60E-3688-487E-8CEE-D75F05BB3008");
+	this.setProps({
+        format: Characteristic.Formats.STRING,
+        perms: [Characteristic.Perms.READ, Characteristic.Perms.NOTIFY]
+	});
+	this.value = this.getDefaultValue();
+}
+util.inherits(Characteristic.SunriseTime, Characteristic);
+Characteristic.SunriseTime.UUID = "0D96F60E-3688-487E-8CEE-D75F05BB3008";
+
+Characteristic.SunsetTime = function () {
+	Characteristic.call(this, "Sunset", "3DE24EE0-A288-4E15-A5A8-EAD2451B727C");
+	this.setProps({
+        format: Characteristic.Formats.STRING,
+        perms: [Characteristic.Perms.READ, Characteristic.Perms.NOTIFY]
+	});
+	this.value = this.getDefaultValue();
+}
+util.inherits(Characteristic.SunsetTime, Characteristic);
+Characteristic.SunsetTime.UUID = "3DE24EE0-A288-4E15-A5A8-EAD2451B727C";
+
+Characteristic.UVIndex = function () {
+	Characteristic.call(this, "UV Index", "05BA0FE0-B848-4226-906D-5B64272E05CE");
+	this.setProps({
+        format: Characteristic.Formats.UINT8,
+        perms: [Characteristic.Perms.READ, Characteristic.Perms.NOTIFY],
+        minValue: 0,
+        maxValue: 16
+	});
+	this.value = this.getDefaultValue();
+}
+util.inherits(Characteristic.UVIndex, Characteristic);
+Characteristic.UVIndex.UUID = "05BA0FE0-B848-4226-906D-5B64272E05CE";
+
+Characteristic.Visibility = function () {
+	Characteristic.call(this, "Visibility", "D24ECC1E-6FAD-4FB5-8137-5AF88BD5E857");
+	this.setProps({
+        format: Characteristic.Formats.UINT8,
+        perms: [Characteristic.Perms.READ, Characteristic.Perms.NOTIFY],
+        unit: "km",
+        minValue: 0,
+        maxValue: 100
+	});
+	this.value = this.getDefaultValue();
+}
+util.inherits(Characteristic.Visibility, Characteristic);
+Characteristic.Visibility.UUID = "D24ECC1E-6FAD-4FB5-8137-5AF88BD5E857";
+
+Characteristic.WindDirection = function () {
+	Characteristic.call(this, "Wind Direction", "46F1284C-1912-421B-82F5-EB75008B167E");
+	this.setProps({
+        format: Characteristic.Formats.STRING,
+        perms: [Characteristic.Perms.READ, Characteristic.Perms.NOTIFY]
+	});
+	this.value = this.getDefaultValue();
+}
+util.inherits(Characteristic.WindDirection, Characteristic);
+Characteristic.WindDirection.UUID = "46F1284C-1912-421B-82F5-EB75008B167E";
+
+Characteristic.WindSpeed = function () {
+	Characteristic.call(this, "Wind Speed", "49C8AE5A-A3A5-41AB-BF1F-12D5654F9F41");
+	this.setProps({
+        format: Characteristic.Formats.FLOAT,
+        perms: [Characteristic.Perms.READ, Characteristic.Perms.NOTIFY],
+        unit: "km/h",
+        minValue: 0,
+        maxValue: 150,
+        minStep: 0.1
+	});
+	this.value = this.getDefaultValue();
+}
+util.inherits(Characteristic.WindSpeed, Characteristic);
+Characteristic.WindSpeed.UUID = "49C8AE5A-A3A5-41AB-BF1F-12D5654F9F41";
 
 module.exports = HomeKitHistory;
