@@ -5,7 +5,7 @@
 // Cleaned up/recoded
 //
 // Mark Hulskamp
-// 7/4/2022
+// 3/5/2022
 //
 // done
 // -- switching camera stream on/off - going from off to on doesn't restart stream from Nest
@@ -13,6 +13,7 @@
 // -- buffering of stream ie: const streaming from nexus
 // -- routing of data to multiple connected ffmpeg processing streams. Allows single connection to nexus for the source stream
 // -- restart connection when dropped if buffering
+// -- support both Nest and Google accounts
 // 
 // todo
 // -- When camera goes offline, we don't get notified straight away and video stream stops. Perhaps timer to go to camera off image if no data receieve in past 15 seconds?
@@ -117,7 +118,7 @@ const ClientType = {
 
 
 class NexusStreamer {
-	constructor(accessToken, cameraData, debug) {
+	constructor(cameraAccess, cameraData, debug) {
         this.ffmpeg = [];   // array of ffmpeg streams for the socket connection
 
         this.socket = null;
@@ -134,7 +135,17 @@ class NexusStreamer {
 
         this.host = cameraData.websocket_nexustalk_host;  // Inital host to connect to
 
-        this.accessToken = accessToken; // Access token for authorisation
+        // Get access token and set token type
+        this.accessToken = "";
+        if (cameraAccess.key.toUpperCase() == "COOKIE") {
+            this.tokenType = "nest";    // Nest account token type
+            this.accessToken = cameraAccess.value.replace(/website_2=/ig, "");  // Access token for authorisation
+        }
+        if (cameraAccess.key.toUpperCase() == "AUTHORIZATION") {
+            this.tokenType = "google";  // Google account token type
+            this.accessToken = cameraAccess.value.replace(/basic /ig, "");  // Access token for authorisation
+        }
+
         this.camera = cameraData; // Current camera data
 
         this.debug = typeof debug == "boolean" ? debug : false; // debug status
@@ -159,7 +170,7 @@ NexusStreamer.prototype.startBuffering = function(milliseconds) {
     if (typeof this.ffmpeg.find(({ type }) => type == "buffer") == "undefined") {
         // We only support one buffering stream per Nexus object ie: per camera
         if (typeof milliseconds == "undefined") {
-            milliseonds = 15000;    // Wasnt specified how much streaming time we hold in our buffer, so default to 15 seconds
+            milliseconds = 15000;    // Wasnt specified how much streaming time we hold in our buffer, so default to 15 seconds
         }
 
         this.ffmpeg.push({type: "buffer", video: null, audio: null, size: milliseconds, buffer: []});   // push onto our ffmpeg streams array
@@ -310,8 +321,16 @@ NexusStreamer.prototype.stopBuffering = function() {
     }
 }
 
-NexusStreamer.prototype.update = function(accessToken, cameraData) {
-    if (accessToken && accessToken != this.accessToken) {
+NexusStreamer.prototype.update = function(cameraAccess, cameraData) {
+    if (cameraAccess.key.toUpperCase() == "COOKIE") {
+        var tokenType = "nest";    // Nest account token type
+        var accessToken = cameraAccess.value.replace(/website_2=/ig, "");  // Access token for authorisation
+    }
+    if (cameraAccess.key.toUpperCase() == "AUTHORIZATION") {
+        var tokenType = "google";  // Google account token type
+        var accessToken = cameraAccess.value.replace(/basic /ig, "");  // Access token for authorisation
+    }
+    if (accessToken != this.accessToken || tokenType != this.tokenType) {
         // access token has changed, so re-authorise
         this.accessToken = accessToken; // Update token
         this.__Authenticate(true);    // Update authorisation only
@@ -505,8 +524,12 @@ NexusStreamer.prototype.__Authenticate = function(reauthorise) {
     // Authenticate over created socket connection
     var tokenBuffer = new protoBuf();
     var helloBuffer = new protoBuf();
-    tokenBuffer.writeStringField(1, this.accessToken);   // Tag 1, session token, Nest auth accounts
-    // tokenBuffer.writeStringField(4, this.accessToken);   // Tag 4, olive token, Google auth accounts
+    if (this.tokenType == "nest") {
+        tokenBuffer.writeStringField(1, this.accessToken);   // Tag 1, session token, Nest auth accounts
+    }
+    if (this.tokenType == "google") {
+        tokenBuffer.writeStringField(4, this.accessToken);   // Tag 4, olive token, Google auth accounts
+    }
     if (typeof reauthorise == "boolean" && reauthorise == true) {
         // Request to re-authorise only
         this.debug && console.debug("[NEXUS] Re-authentication to '%s'", this.host);
@@ -520,8 +543,12 @@ NexusStreamer.prototype.__Authenticate = function(reauthorise) {
         helloBuffer.writeStringField(6, this.camera.serial_number);
         helloBuffer.writeStringField(7, USERAGENT);
         helloBuffer.writeVarintField(9, ClientType.WEB);
-        helloBuffer.writeStringField(4, this.accessToken);   // session token, Nest auth accounts
-       // helloBuffer.writeBytesField(12, tokenBuffer.finish());    // olive token, Google auth accounts
+        if (this.tokenType == "nest") {
+            helloBuffer.writeStringField(4, this.accessToken);   // session token, Nest auth accounts
+        }
+        if (this.tokenType == "google") {
+            helloBuffer.writeBytesField(12, tokenBuffer.finish());    // olive token, Google auth accounts
+        }
         this.__sendMessage(PacketType.HELLO, helloBuffer.finish());
     }
 }

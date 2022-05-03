@@ -14,7 +14,6 @@
 // todo
 // -- 2FA due to Nest changes end of May 2020??
 // -- add Nest home name to pairing names (easier for mutiple homes)??
-// -- Google auth???? Not worried yet as only use Nest auth
 // -- Locks??
 // -- weather accessory using nest weather data API???
 //
@@ -39,6 +38,7 @@
 //      -- Pathway light as a light service? No sure can get info
 //
 // done
+// -- Google account auth via refreshtoken method 
 // -- recoding and renaming (9/3/2022) - minus deprecated functions
 // -- use events framework for notifying internally of device updates
 // -- debugging option in configuration file
@@ -52,7 +52,7 @@
 // -- subscribe to events rather than polling every 30secs
 // -- recoded device getting from Nest
 // -- ground work for subscribe updates
-// -- removed extra call to API for camera details. maybe very slightly faster updating
+// -- removed extra call to API for camera details. slightly faster updating
 // -- split out camera details/alerts into sperate polling loop
 //
 // -- Nest Thermostat
@@ -96,7 +96,7 @@
 //    Access token can be view by logging in to https//home.nest.com on webbrowser then in going to https://home.nest.com/session  Seems access token expires every 30days
 //    so needs manually updating (haven't seen it expire yet.....)
 //
-// Version 19/4/2022
+// Version 3/5/2022
 // Mark Hulskamp
 
 module.exports = accessories = [];
@@ -131,17 +131,19 @@ const CAMERAZONEPOLLING = 30000;                    // Camera zones changes poll
 const DOORBELLCOOLDOWN = 60000;                     // Cooldown for Nest doorbell button pressed
 const PERSONCOOLDOWN = 120000;                      // Cooldown for Nest camera detecting a person/face
 const MOTIONCOOLDOWN = 60000;                       // Cooldown for HomeKit Secure Video motion recording
-const HKSVBUFFERSIZE = 30000;                       // Default time we hold in HomeKit Secure Video buffering
-const LOWBATTERYLEVEL = 10;                         // Low level battery percentage
+const LOWBATTERYLEVEL = 10;                         // Low battery level percentage
 
 const NESTSTRUCTURECHANGE = "structure";            // Nest structure change event
+const MP4BOX = "mp4box";                            // MP4 box fragement event
 
 class NestClass extends EventEmitter {
 	constructor() {
         super();
 
+        this.refreshToken = "";                     // Session token. Used for Nest accounts
+        this.sessionToken = "";                     // Refresh token. Used for Google accounts
         this.nestToken = "";                        // Access token for requests
-        this.nestCookie = "";                       // WEBSITE_2 cookie. used for camera requests
+        this.cameraAPI = {key: "", value: ""};      // Header Keys for camera API calls
         this.nestURL = "";                          // URL for nest requests
         this.nestID = "";                           // User ID
         this.tokenExpire = null;                    // Time when token expires (in Unix timestamp)
@@ -155,6 +157,7 @@ class NestClass extends EventEmitter {
         this.cancel = null;
         this.debug = false;                         // Enable debug output, no by default
         this.HomeKitSecureVideo = false;            // Enable HKSV for all camera/doorbells, no by default
+        this.HomeKitSecureVideoBufSize = 0;         // Milliseconds seconds to hold in buffer. Pre-buffering disabled by default with value 0
         this.startTime = null;                      // Time we started the object. used to filter out old alerts
 
         // Load configuration
@@ -163,9 +166,11 @@ class NestClass extends EventEmitter {
 
             config && Object.entries(config).forEach(([key, value]) => {
                 // Process configuration items
-                if (key.toUpperCase() == "SESSIONTOKEN") this.nestToken = value;  // Session token to use for Nest calls
+                if (key.toUpperCase() == "SESSIONTOKEN") this.sessionToken = value;  // Nest accounts Session token to use for Nest calls
+                if (key.toUpperCase() == "REFRESHTOKEN") this.refreshToken = value;  // Google accounts refresh token to use for Nest calls
                 if (key.toUpperCase() == "DEBUG" && typeof value == "boolean") this.debug = value;  // Debugging output
                 if (key.toUpperCase() == "HKSV" && typeof value == "boolean") this.HomeKitSecureVideo = value;    // default for HomeKit Secure Video
+                if (key.toUpperCase() == "HKSVPREBUFFER" && typeof value == "number") this.HomeKitSecureVideoBufSize = value;   // default pre-buffer sizing
                 if (typeof value == "object") {
                     // Assume since key value is an object, its a device configuration for matching serial number
                     this.extraOptions[key.toUpperCase()] = {};
@@ -919,7 +924,7 @@ CameraClass.prototype.addDoorbellCamera = function(HomeKitAccessory, thisService
         });
     }
 
-    this.NexusStreamer = new NexusStreamer(this.nestObject.nestCookie, deviceData, this.nestObject.debug);  // Create streamer object
+    this.NexusStreamer = new NexusStreamer(this.nestObject.cameraAPI, deviceData, this.nestObject.debug);  // Create streamer object
 
     this.updateHomeKit(HomeKitAccessory, deviceData);  // Do initial HomeKit update
     console.log("Setup %s '%s' on '%s'", HomeKitAccessory.displayName, thisServiceName, HomeKitAccessory.username, deviceData.HKSV == true ? "with HomeKit Secure Video" : this.MotionServices.length >= 1 ? "with motion sensor(s)" : "");
@@ -935,8 +940,8 @@ CameraClass.prototype.handleRecordingStreamRequest = async function *(streamId) 
         + " -use_wallclock_as_timestamps 1"
         + " -i pipe:0"
         + " -map 0:v"
-        + " -codec:v h264_omx"    // Old Raspberry Pi hardware encoder/decoder
-        //+ " -codec:v libx264"    // Old Raspberry Pi hardware encoder/decoder
+        //+ " -codec:v h264_omx"    // Old Raspberry Pi hardware encoder/decoder
+        + " -codec:v libx264"    // Software encoder/decoder
         + " -pix_fmt yuv420p"
         + " -profile:v " + (this.HKSVRecordingConfig.videoCodec.parameters.profile == 0x02 ? "high" : this.HKSVRecordingConfig.videoCodec.parameters.profile == 0x02 ? "main" : "baseline")
         + " -level:v " + (this.HKSVRecordingConfig.videoCodec.parameters.level == 0x02 ? "4.0" : this.HKSVRecordingConfig.videoCodec.parameters.level == 0x01 ? "3.2": "3.1")
@@ -954,8 +959,8 @@ CameraClass.prototype.handleRecordingStreamRequest = async function *(streamId) 
         ffmpegCommand = ffmpegCommand 
         + " -force_key_frames expr:gte\(t,n_forced*" + this.HKSVRecordingConfig.videoCodec.parameters.iFrameInterval / 1000 + "\)"
         + " -r " + this.HKSVRecordingConfig.videoCodec.resolution[2].toString()
-        + " -fflags +genpts+discardcorrupt+igndts"
-        + " -reset_timestamps 1"
+        + " -fflags +genpts+discardcorrupt"
+        //+ " -reset_timestamps 1"
         + " -movflags frag_keyframe+empty_moov+default_base_moof"
         + " -f mp4"
         + " pipe:1";
@@ -968,7 +973,7 @@ CameraClass.prototype.handleRecordingStreamRequest = async function *(streamId) 
 
         this.HKSVBuffer = [];
         this.HKSVffmpegRecorder = spawn("ffmpeg", ffmpegCommand.split(" "), { env: process.env });
-        this.nestObject.debug && console.debug("[NEST] ffmpeg command is '%s'", ffmpegCommand);
+        //this.nestObject.debug && console.debug("[NEST] ffmpeg command is '%s'", ffmpegCommand);
 
         // Process FFmpeg output and parse out the fMP4 stream it's generating for HomeKit Secure Video.
         this.HKSVffmpegRecorder.stdout.on("data", function (datastream) {
@@ -1002,7 +1007,7 @@ CameraClass.prototype.handleRecordingStreamRequest = async function *(streamId) 
 
                 // Add it to our queue to be pushed out through the generator function.
                 this.HKSVBuffer.push({ data: data, header: header, length: dataLength, type: type });
-                this.HKSVEvents.emit("mp4box");
+                this.HKSVEvents.emit(MP4BOX);
 
                 // Prepare to start a new box for the next buffer that we will be processing.
                 data = Buffer.alloc(0);
@@ -1031,9 +1036,9 @@ CameraClass.prototype.handleRecordingStreamRequest = async function *(streamId) 
             this.nestObject.debug && console.debug("[NEST] HKSV ffmpeg recorder process error", error);
         }.bind(this));
 
-        //this.HKSVffmpegRecorder.stderr.on("data", function (data) {
-        //    this.nestObject.debug && console.debug(data.toString());
-        //}.bind(this));
+        /*this.HKSVffmpegRecorder.stderr.on("data", function (data) {
+            this.nestObject.debug && console.debug(data.toString());
+        }.bind(this)); */
 
         this.NexusStreamer.startRecordStream("HKSV" + streamId, this.HKSVffmpegRecorder, this.HKSVffmpegRecorder.stdin, null);
         this.nestObject.debug && console.debug("[NEST] Started HKSV recording on '%s' with stream ID of '%s'", this.deviceID, streamId);
@@ -1078,17 +1083,13 @@ CameraClass.prototype.segmentGenerator = async function *() {
         }
         if (this.HKSVBuffer == null || this.HKSVBuffer.length == 0) {
             // since the ffmpeg recorder process hasn't notified us of any mp4 fragment boxes, so wait until there are some
-            await EventEmitter.once(this.HKSVEvents, "mp4box", this.segmentGenerator);
+            await EventEmitter.once(this.HKSVEvents, MP4BOX, this.segmentGenerator);
         }
 
         var mp4box = this.HKSVBuffer && this.HKSVBuffer.shift();
-        if (typeof mp4box != "object") {
+        if (mp4box == null || typeof mp4box != "object") {
             // Not an mp4 fragment box, so try again
             continue;
-        }
-
-        if (mp4box == null || mp4box.header == null) {
-            console.log(mp4box);
         }
 
         // Queue up this fragment mp4 box to send back to HomeKit.
@@ -1112,8 +1113,8 @@ CameraClass.prototype.closeRecordingStream = function(streamId, reason) {
     this.NexusStreamer && this.NexusStreamer.stopRecordStream("HKSV" + streamId);
     this.HKSVffmpegRecorder && this.HKSVffmpegRecorder.kill("SIGKILL");
     this.HKSVffmpegRecorder = null;
-    this.HKSVEvents.emit("mp4box");
-    this.HKSVEvents.removeListener("mp4box", this.segmentGenerator);  // Tidy up
+    this.HKSVEvents.emit(MP4BOX);
+    this.HKSVEvents.removeAllListeners(MP4BOX, this.segmentGenerator);  // Tidy up
     this.HKSVBuffer = null;
     this.nestObject.debug && console.debug("[NEST] Finished HKSV recording on stream '%s' with stream ID of '%s'", this.deviceID, streamId, reason);
 }
@@ -1148,7 +1149,7 @@ CameraClass.prototype.handleSnapshotRequest = async function(request, callback) 
         if (this.nestObject.nestDevices[this.deviceID].streaming_enabled == true && this.nestObject.nestDevices[this.deviceID].online == true) {
             // grab snapshot from doorbell/camera stream. If we have an current event, get the snapshot for that event for a non-HKSV camera
             if (this.nestObject.nestDevices[this.deviceID].HKSV == false && this.snapshotEvent.type != "" && this.snapshotEvent.done == false) {
-                await axios.get(this.nestObject.nestDevices[this.deviceID].nexus_api_nest_domain_host + "/event_snapshot/" + this.nestObject.nestDevices[this.deviceID].camera_uuid + "/" + this.snapshotEvent.id + "?crop_type=timeline&width=" + request.width, {responseType: "arraybuffer", headers: {"user-agent": USERAGENT, "accept" : "*/*", "cookie": "website_2=" + this.nestObject.nestCookie}, timeout: NESTAPITIMEOUT, retry: 3 /*, retryDelay: 2000 */})
+                await axios.get(this.nestObject.nestDevices[this.deviceID].nexus_api_nest_domain_host + "/event_snapshot/" + this.nestObject.nestDevices[this.deviceID].camera_uuid + "/" + this.snapshotEvent.id + "?crop_type=timeline&width=" + request.width, {responseType: "arraybuffer", headers: {"user-agent": USERAGENT, "accept" : "*/*", [this.nestObject.cameraAPI.key] : this.nestObject.cameraAPI.value}, timeout: NESTAPITIMEOUT, retry: 3 /*, retryDelay: 2000 */})
                 .then(response => {
                     if (response.status == 200) {
                         image = response.data;
@@ -1160,7 +1161,7 @@ CameraClass.prototype.handleSnapshotRequest = async function(request, callback) 
                 });
             } else {
                     // Get current image from the doorbell/camera feed
-                    await axios.get(this.nestObject.nestDevices[this.deviceID].nexus_api_http_server_url + "/get_image?width=" + request.width + "&uuid=" + this.nestObject.nestDevices[this.deviceID].camera_uuid, {responseType: "arraybuffer", headers: {"user-agent": USERAGENT, "accept" : "*/*", "cookie": "website_2=" + this.nestObject.nestCookie}, timeout: NESTAPITIMEOUT/*, retry: 3, retryDelay: 2000 */})
+                    await axios.get(this.nestObject.nestDevices[this.deviceID].nexus_api_http_server_url + "/get_image?width=" + request.width + "&uuid=" + this.nestObject.nestDevices[this.deviceID].camera_uuid, {responseType: "arraybuffer", headers: {"user-agent": USERAGENT, "accept" : "*/*", [this.nestObject.cameraAPI.key] : this.nestObject.cameraAPI.value}, timeout: NESTAPITIMEOUT/*, retry: 3, retryDelay: 2000 */})
                     .then(response => {
                     if (response.status == 200) {
                         image = response.data;
@@ -1317,7 +1318,7 @@ CameraClass.prototype.updateHomeKit = function(HomeKitAccessory, deviceData) {
         this.controller.setSpeakerMuted(deviceData.audio_enabled == false ? true : false);    // if audio is disabled, we'll mute speaker
 
         // Update any camera details if we have a Nexus streamer object created
-        this.NexusStreamer && this.NexusStreamer.update(this.nestObject.nestCookie, deviceData);
+        this.NexusStreamer && this.NexusStreamer.update(this.nestObject.cameraAPI, deviceData);
 
         // For non-HKSV enabled devices, we process activity zone changes
         if (deviceData.HKSV == false && (JSON.stringify(deviceData.activity_zones) != this.nestObject.nestDevices[this.deviceID].activity_zones)) {
@@ -1559,39 +1560,70 @@ CameraClass.prototype.__buildAudioStream = function(request, sessionInfo, callba
 
 // Nest object
 NestClass.prototype.initNestConnection = async function() {
-    if (this.nestToken != "") {
-        await Promise.all([
-            axios.get("https://home.nest.com/session", {headers: {"user-agent": USERAGENT, "Authorization": "Basic " + this.nestToken} }),
-            axios.post(CAMERAAPIHOST + "/api/v1/login.login_nest", Buffer.from("access_token=" + this.nestToken, "utf8"), {withCredentials: true, headers: {"referer": REFERER, "Content-Type": "application/x-www-form-urlencoded", "user-agent": USERAGENT} })
-        ])
-        .then(function (responses) {
-            if (responses[0].status == 200) {
-                this.nestToken = responses[0].data.access_token;
-                this.nestURL = responses[0].data.urls.transport_url;
-                this.nestID = responses[0].data.userid;
-                this.tokenExpire = Math.floor(new Date(responses[0].data.expires_in) / 1000);
-
-                // Set timer to refresh access token expiry time/date if we haven't started one yet
-                if (this.tokenTimer == null) {
-                    this.tokenTimer = setInterval(async function() {
-                        this.initNestConnection();
-                    }.bind(this), (3600 * 12 * 1000)); // Refresh every day
-                }
-            } else {
-                this.debug && console.debug("[NEST] Failed to get access Nest API session. HTTP status returned", responses[0].status);
+    // Connect to Nest. We support the Nest session token and Google refresh token methods
+    this.tokenExpire = null;    // Get below
+    this.nestToken = "";    // Clear token
+    if (this.refreshToken != "") {
+        // Google refresh token method. 
+        // Use login.js taken from homebridge_nest or homebridge_nest_cam to obtain
+        this.debug && console.debug("[NEST] Performing Google account authorisation");
+        await axios.post("https://oauth2.googleapis.com/token", "refresh_token=" + this.refreshToken + "&client_id=733249279899-1gpkq9duqmdp55a7e5lft1pr2smumdla.apps.googleusercontent.com&grant_type=refresh_token", {headers: {"Content-Type": "application/x-www-form-urlencoded", "user-agent": USERAGENT}})
+        .then(async (response) => {
+            if (response.status == 200) {
+                await axios.post("https://nestauthproxyservice-pa.googleapis.com/v1/issue_jwt", "embed_google_oauth_access_token=true&expire_after=3600s&google_oauth_access_token=" + response.data.access_token + "&policy_id=authproxy-oauth-policy", {headers: {"referer": REFERER,"user-agent": USERAGENT, "Authorization": "Bearer " + response.data.access_token} })
+                .then(async (response) => {
+                    if (response.status == 200) {
+                        this.nestToken = response.data.jwt;
+                        this.tokenExpire = Math.floor(new Date(response.data.claims.expirationTime) / 1000);   // Token expiry, should be 1hr
+                        this.cameraAPI.key = "Authorization"; // We'll put this in API header calls for cameras
+                        this.cameraAPI.value = "Basic " + response.data.jwt; // We'll put this in API header calls for cameras
+                    }
+                })
             }
-
-            if (responses[1].status == 200 && responses[1].data && responses[1].data.status == 0) {
-                this.nestCookie = responses[1].data.items[0].session_token;    // WEBSITE_2 cookie for camera API calls
-            } else {
-                this.debug && console.debug("[NEST] Failed to get WEBSITE_2 cookie for camera API calls. HTTP status returned", responses[1].status);
-            }
-        }.bind(this))
+        })
         .catch(error => {
-            this.debug && console.debug("[NEST] Nest API access failed with error", error.message);
+        });
+    }
+
+    if (this.sessionToken != "") {
+        // Nest session token method. Get WEBSITE2 cookie for use with camera API calls if needed later
+        this.debug && console.debug("[NEST] Performing Nest account authorisation");
+        await axios.post(CAMERAAPIHOST + "/api/v1/login.login_nest", Buffer.from("access_token=" + this.sessionToken, "utf8"), {withCredentials: true, headers: {"referer": "https://home.nest.com", "Content-Type": "application/x-www-form-urlencoded", "user-agent": USERAGENT} })
+        .then((response) => {
+            if (response.status == 200 && response.data && response.data.status == 0) {
+                this.nestToken = this.sessionToken; // Since we got camera details, this is a good token to use
+                this.cameraAPI.key = "cookie";  // We'll put this in API header calls for cameras
+                this.cameraAPI.value = "website_2=" + response.data.items[0].session_token; // We'll put this in API header calls for cameras
+            }
+        })
+        .catch(error => {
+        });
+    }
+
+    if (this.nestToken != "") {
+        // We have a token, so open Nest session to get further details we require
+        await axios.get("https://home.nest.com/session", {headers: {"user-agent": USERAGENT, "Authorization": "Basic " + this.nestToken} })
+        .then((response) => {
+            if (response.status == 200) {
+                this.nestURL = response.data.urls.transport_url;
+                this.nestID = response.data.userid;
+
+                if (this.tokenExpire == null) {
+                    this.tokenExpire = Math.floor(Date.now() / 1000) + (3600 * 12);  // 24hrs expiry from now
+                }
+
+                // Set timer to token expiry time/date refresh
+                clearInterval(this.tokenTimer)
+                this.tokenTimer = setInterval(async function() {
+                    this.initNestConnection();
+                }.bind(this), (this.tokenExpire - Math.floor(Date.now() / 1000) - 60) * 1000); // Refresh just before token expiry
+                this.debug && console.debug("[NEST] Successfully authorised to Nest");
+            }
+        })
+        .catch(error => {
         });
     } else {
-        this.debug && console.debug("[NEST] Empty access token in configuration file")
+        this.debug && console.debug("[NEST] Authorisation to Nest failed");
     }
 }
 
@@ -1607,7 +1639,7 @@ NestClass.prototype.getNestData = async function() {
                     this.rawNestData.quartz[deviceID].alerts = [];  // no active alerts yet
                     this.rawNestData.quartz[deviceID].properties = [];  // no properties yet
                     this.rawNestData.quartz[deviceID].nexus_api_nest_domain_host = camera.nexus_api_http_server_url.replace(/dropcam.com/ig, "camera.home.nest.com");  // avoid extra API call to get this detail by simple domain name replace
-                    await axios.get(this.rawNestData.quartz[deviceID].nexus_api_nest_domain_host + "/cuepoint_category/" + deviceID, {headers: {"user-agent": USERAGENT, "cookie": "website_2=" + this.nestCookie} })
+                    await axios.get(this.rawNestData.quartz[deviceID].nexus_api_nest_domain_host + "/cuepoint_category/" + deviceID, {headers: {"user-agent": USERAGENT, [this.cameraAPI.key] : this.cameraAPI.value} })
                     .then(async (response)=> {
                         if (response.status && response.status == 200) {
                             // Insert activity zones into the nest structure
@@ -1618,7 +1650,7 @@ NestClass.prototype.getNestData = async function() {
                             })
                         }
                     })
-                    await axios.get(CAMERAAPIHOST + "/api/cameras.get_with_properties?uuid=" + deviceID, {headers: {"user-agent": USERAGENT, "Referer" : REFERER, "cookie": "website_2=" + this.nestCookie}, responseType: "json", timeout: NESTAPITIMEOUT})
+                    await axios.get(CAMERAAPIHOST + "/api/cameras.get_with_properties?uuid=" + deviceID, {headers: {"user-agent": USERAGENT, "Referer" : REFERER, [this.cameraAPI.key] : this.cameraAPI.value}, responseType: "json", timeout: NESTAPITIMEOUT})
                     .then((response) => {
                         if (response.status && response.status == 200) {
                             // Insert extra camera properties. We need this information to use with HomeKit Secure Video
@@ -1635,8 +1667,6 @@ NestClass.prototype.getNestData = async function() {
         .catch(error => {
             this.debug && console.debug("[NEST] Nest data get failed with error", error.message);
         });
-    } else {
-        this.debug && console.debug("[NEST] Empty access token or access URL or user ID when calling function");
     }
 }
 
@@ -1648,15 +1678,11 @@ NestClass.prototype.setNestStructure = async function(nestStructure, key, value,
             if (response.status == 200) {
                 this.debug && console.debug("[NEST] Successfully set Nest structure element of '%s' to '%s' on '%s", key, value, nestStructure);
                 retValue = true;    // successfully set Nest structure value
-            } else {
-                this.debug && console.debug("[NEST] Failed to set Nest structure element. HTTP status returned", response.status);
             }
         })
         .catch(error => {
             this.debug && console.debug("[NEST] Failed to set Nest structure element with error", error.message);
         });
-    } else {
-        this.debug && console.debug("[NEST] Empty access token or access URL or user ID when calling function");
     }
     return retValue;
 }
@@ -1664,13 +1690,11 @@ NestClass.prototype.setNestStructure = async function(nestStructure, key, value,
 NestClass.prototype.setNestCamera = async function(deviceID, key, value) {
     var retValue = false;
     if (this.nestToken != "" && this.nestURL != "" && this.nestID != "" && deviceID != "") {
-        await axios.post(CAMERAAPIHOST + "/api/dropcams.set_properties", [key] + "=" + value + "&uuid=" + this.nestDevices[deviceID].camera_uuid, {headers: {"content-type": "application/x-www-form-urlencoded", "user-agent": USERAGENT, "Referer" : REFERER, "cookie": "website_2=" + this.nestCookie}, responseType: "json", timeout: NESTAPITIMEOUT})
+        await axios.post(CAMERAAPIHOST + "/api/dropcams.set_properties", [key] + "=" + value + "&uuid=" + this.nestDevices[deviceID].camera_uuid, {headers: {"content-type": "application/x-www-form-urlencoded", "user-agent": USERAGENT, "Referer" : REFERER, [this.cameraAPI.key] : this.cameraAPI.value}, responseType: "json", timeout: NESTAPITIMEOUT})
         .then((response) => {
             if (response.status == 200 && response.data.status == 0) {
                 this.debug && console.debug("[NEST] Successfully set Nest Camera element of '%s' to '%s' on '%s", key, value, deviceID);
                 retValue = true;    // successfully set Nest camera value
-            } else {
-                this.debug && console.debug("[NEST] Failed to set Nest Camera element. HTTP status returned", response.status);
             }
         })
         .catch(error => {
@@ -2057,6 +2081,7 @@ NestClass.prototype.__processNestData = function(nestData) {
 
                 // Insert any extra options we've read in from configuration file for this device
                 this.nestDevices[camera.serial_number].HKSV = this.HomeKitSecureVideo;    // By default, we use the global config option for HomeKit Secure Video. Can override for each camera etc
+                this.nestDevices[camera.serial_number].HKSVPreBuffer = this.HomeKitSecureVideoBufSize;  // By default, we use the global  config option for HKSV pre buffering size
                 this.extraOptions[camera.serial_number] && Object.entries(this.extraOptions[camera.serial_number]).forEach(([key, value]) => {
                     this.nestDevices[camera.serial_number][key] = value;
                 });
@@ -2068,7 +2093,7 @@ NestClass.prototype.__processNestData = function(nestData) {
 NestClass.prototype.__nestCameraPolling = function(deviceID, action) {
     if (action == "alerts" && typeof this.nestDevices[deviceID] == "object") {
         // Get any alerts generated in the last 30 seconds
-        axios.get(this.nestDevices[deviceID].nexus_api_nest_domain_host + "/cuepoint/" + this.nestDevices[deviceID].camera_uuid + "/2?start_time=" + Math.floor((Date.now() / 1000) - 30), {headers: {"user-agent": USERAGENT, "Referer" : REFERER, "cookie": "website_2=" + this.nestCookie}, responseType: "json", timeout: 1000, retry: 3, retryDelay: 1000})
+        axios.get(this.nestDevices[deviceID].nexus_api_nest_domain_host + "/cuepoint/" + this.nestDevices[deviceID].camera_uuid + "/2?start_time=" + Math.floor((Date.now() / 1000) - 30), {headers: {"user-agent": USERAGENT, "Referer" : REFERER, [this.cameraAPI.key] : this.cameraAPI.value}, responseType: "json", timeout: 1000, retry: 3, retryDelay: 1000})
         .then((response) => {
             if (response.status == 200) {
                 // Filter out any alert which occured before we started this accessory
@@ -2107,7 +2132,7 @@ NestClass.prototype.__nestCameraPolling = function(deviceID, action) {
 
     if (action == "zones" && typeof this.nestDevices[deviceID] == "object" && this.nestDevices[deviceID].HKSV == false) {
         // Get current activity zones for non-HSKV enabled camera
-        axios.get(this.nestDevices[deviceID].nexus_api_nest_domain_host + "/cuepoint_category/" + this.nestDevices[deviceID].camera_uuid, {headers: {"user-agent": USERAGENT, "Referer" : REFERER, "cookie": "website_2=" + this.nestCookie}, responseType: "json", timeout: CAMERAZONEPOLLING})
+        axios.get(this.nestDevices[deviceID].nexus_api_nest_domain_host + "/cuepoint_category/" + this.nestDevices[deviceID].camera_uuid, {headers: {"user-agent": USERAGENT, "Referer" : REFERER, [this.cameraAPI.key] : this.cameraAPI.value}, responseType: "json", timeout: CAMERAZONEPOLLING})
         .then((response) => {
             if (response.status == 200) {
                 // Insert activity zones into the nest structure we've read before
@@ -2218,7 +2243,7 @@ NestClass.prototype.__nestAPISubscribe = async function() {
 
                     // Get extra camera properties if quartz change. We use this information with HomeKit Secure Video
                     if (mainKey == "quartz") {
-                        await axios.get(CAMERAAPIHOST + "/api/cameras.get_with_properties?uuid=" + subKey, {headers: {"user-agent": USERAGENT, "Referer" : REFERER, "cookie": "website_2=" + this.nestCookie}, responseType: "json", timeout: NESTAPITIMEOUT})
+                        await axios.get(CAMERAAPIHOST + "/api/cameras.get_with_properties?uuid=" + subKey, {headers: {"user-agent": USERAGENT, "Referer" : REFERER, [this.cameraAPI.key] : this.cameraAPI.value}, responseType: "json", timeout: NESTAPITIMEOUT})
                         .then((response) => {
                             if (response.status && response.status == 200) {
                                 this.rawNestData[mainKey][subKey].properties = response.data.items[0].properties;
@@ -2610,7 +2635,7 @@ axios.interceptors.response.use(undefined, function axiosRetryInterceptor(err) {
 
 // Startup code
 var nest = new NestClass();
-if (nest.nestToken != "") {
+if (nest.sessionToken != "" || nest.refreshToken != "") {
     nest.initNestConnection()   // Initiate connection to Nest APIs
     .then(() => {
         nest.getNestData()
