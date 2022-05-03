@@ -1,5 +1,7 @@
 {
-    "SessionToken" : "<nest session token here>",
+    "SessionToken" : "<nest session token here or blank>",
+    "RefreshToken" : "<google refresh token here or blank>",
     "Debug" : false,
-    "HKSV" : true
+    "HKSV" : true,
+    "HKSVPreBuffer" : 15000
 }
