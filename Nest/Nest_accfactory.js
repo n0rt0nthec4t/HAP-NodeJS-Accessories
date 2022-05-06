@@ -1741,8 +1741,9 @@ NestClass.prototype.deviceSubscribe = function(deviceID, HomeKitAccessory, callb
                 this.removeAllListeners(deviceID, this.deviceEvents[deviceID].callback);    // Remove lister for device updates
                 delete this.deviceEvents[deviceID];
 
-                if (this.nestDevices[deviceID].device_type == "doorbell" || this.nestDevices[deviceID].device_type == "camera") {
-                    // Cancel camera polling loops
+                if (this.previousDevices[deviceID] && (this.previousDevices[deviceID].device_type == "doorbell" || this.previousDevices[deviceID].device_type == "camera")) {
+                    // Cancel any camera streaming
+                    // TODO
                 }
             }
             this.cancel && this.cancel("Subscription update loop cancelled");
@@ -2128,8 +2129,11 @@ NestClass.prototype.__nestCameraPolling = function(deviceID, action) {
             this.debug && console.debug("[NEST] Error getting alerts for '%s'", deviceID, error.message)
         })
         .finally(() => {
-            // Poll again for alerts after configured delay
-            setTimeout(this.__nestCameraPolling.bind(this), CAMERAALERTPOLLING, deviceID, "alerts");
+            // Poll again for alerts after configured delay. We'll test here if the deviceID is still our Nest data before calling again
+            // This will allow removed devices to gracefully cancel
+            if (typeof this.nestDevices[deviceID] == "object") {
+                setTimeout(this.__nestCameraPolling.bind(this), CAMERAALERTPOLLING, deviceID, "alerts");
+            }
         });
     }
 
@@ -2160,8 +2164,11 @@ NestClass.prototype.__nestCameraPolling = function(deviceID, action) {
             this.debug && console.debug("[NEST] Error getting zone details for '%s'", deviceID, error.message)
         })
         .finally(() => {
-            // Poll for activity zone changes again after configured delay
-            setTimeout(this.__nestCameraPolling.bind(this), CAMERAZONEPOLLING, deviceID, "zones");
+            // Poll for activity zone changes again after configured delay. We'll test here if the deviceID is still our Nest data before calling again
+            // This will allow removed devices to gracefully cancel
+            if (typeof this.nestDevices[deviceID] == "object") {
+                setTimeout(this.__nestCameraPolling.bind(this), CAMERAZONEPOLLING, deviceID, "zones");
+            }
         });
     }
 }
@@ -2263,7 +2270,7 @@ NestClass.prototype.__nestAPISubscribe = async function() {
                 await this.getNestData();
             }
             this.__processNestData(this.rawNestData);
-           
+
             // Process any updates for devices which aren't in the add/remove list
             this.nestDevices && Object.entries(this.nestDevices).forEach(([deviceID, deviceData]) => {
                 if (tempDeviceList.findIndex( ({ nestID }) => nestID === deviceData.nest_device_structure) == -1) {
@@ -2296,8 +2303,8 @@ NestClass.prototype.__nestAPISubscribe = async function() {
             this.debug && console.debug("[NEST] Nest subscription failed. HTTP status returned", response.status);
         }
     })
-    .catch(async (error) => {
-        if (axios.isCancel(error) == false && error.code !== 'ECONNABORTED') {
+    .catch((error) => {
+        if (axios.isCancel(error) == false && error.code !== "ECONNABORTED" && error.code !== "ETIMEDOUT") {
             if (error.response && error.response.status == 404) {
                 // URL not found
                 subscribeAgainTimeout = 5000;   // Since bad URL, try again after 5 seconds
