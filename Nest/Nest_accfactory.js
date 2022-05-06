@@ -96,7 +96,7 @@
 //    Access token can be view by logging in to https//home.nest.com on webbrowser then in going to https://home.nest.com/session  Seems access token expires every 30days
 //    so needs manually updating (haven't seen it expire yet.....)
 //
-// Version 3/5/2022
+// Version 6/5/2022
 // Mark Hulskamp
 
 module.exports = accessories = [];
@@ -142,7 +142,9 @@ class NestClass extends EventEmitter {
 
         this.refreshToken = "";                     // Session token. Used for Nest accounts
         this.sessionToken = "";                     // Refresh token. Used for Google accounts
-        this.nestToken = "";                        // Access token for requests
+        this.nestToken = "";                        // Access token for Nest API requests
+        this.nestCameraToken = "";                  // Access token for Camera API requests
+        this.nestTokenType = "";                    // Type of account we authorised to Nest with
         this.cameraAPI = {key: "", value: ""};      // Header Keys for camera API calls
         this.nestURL = "";                          // URL for nest requests
         this.nestID = "";                           // User ID
@@ -924,7 +926,7 @@ CameraClass.prototype.addDoorbellCamera = function(HomeKitAccessory, thisService
         });
     }
 
-    this.NexusStreamer = new NexusStreamer(this.nestObject.cameraAPI, deviceData, this.nestObject.debug);  // Create streamer object
+    this.NexusStreamer = new NexusStreamer(this.nestObject.nestCameraToken, this.nestObject.nestTokenType, deviceData, this.nestObject.debug);  // Create streamer object
 
     this.updateHomeKit(HomeKitAccessory, deviceData);  // Do initial HomeKit update
     console.log("Setup %s '%s' on '%s'", HomeKitAccessory.displayName, thisServiceName, HomeKitAccessory.username, deviceData.HKSV == true ? "with HomeKit Secure Video" : this.MotionServices.length >= 1 ? "with motion sensor(s)" : "");
@@ -1125,7 +1127,7 @@ CameraClass.prototype.acknowledgeStream = function(streamId) {
 
 CameraClass.prototype.updateRecordingActive = function(active) {
     // We'll use the change here to determine if we start/stop any buffering
-    if (active == true) {
+    if (active == true && this.nestObject.nestDevices[this.deviceID].HKSVPreBuffer > 0) {
         // Start a buffering stream for this camera/doorbell. Ensures motion captures all video on motion trigger
         // Required due to data delays by on prem Nest to cloud to HomeKit accessory to iCloud etc
         // Make sure have appropriate bandwidth!!!
@@ -1149,7 +1151,7 @@ CameraClass.prototype.handleSnapshotRequest = async function(request, callback) 
         if (this.nestObject.nestDevices[this.deviceID].streaming_enabled == true && this.nestObject.nestDevices[this.deviceID].online == true) {
             // grab snapshot from doorbell/camera stream. If we have an current event, get the snapshot for that event for a non-HKSV camera
             if (this.nestObject.nestDevices[this.deviceID].HKSV == false && this.snapshotEvent.type != "" && this.snapshotEvent.done == false) {
-                await axios.get(this.nestObject.nestDevices[this.deviceID].nexus_api_nest_domain_host + "/event_snapshot/" + this.nestObject.nestDevices[this.deviceID].camera_uuid + "/" + this.snapshotEvent.id + "?crop_type=timeline&width=" + request.width, {responseType: "arraybuffer", headers: {"user-agent": USERAGENT, "accept" : "*/*", [this.nestObject.cameraAPI.key] : this.nestObject.cameraAPI.value}, timeout: NESTAPITIMEOUT, retry: 3 /*, retryDelay: 2000 */})
+                await axios.get(this.nestObject.nestDevices[this.deviceID].nexus_api_nest_domain_host + "/event_snapshot/" + this.nestObject.nestDevices[this.deviceID].camera_uuid + "/" + this.snapshotEvent.id + "?crop_type=timeline&width=" + request.width, {responseType: "arraybuffer", headers: {"user-agent": USERAGENT, "accept" : "*/*", [this.nestObject.cameraAPI.key] : this.nestObject.cameraAPI.value + this.nestObject.nestCameraToken}, timeout: NESTAPITIMEOUT, retry: 3 /*, retryDelay: 2000 */})
                 .then(response => {
                     if (response.status == 200) {
                         image = response.data;
@@ -1161,7 +1163,7 @@ CameraClass.prototype.handleSnapshotRequest = async function(request, callback) 
                 });
             } else {
                     // Get current image from the doorbell/camera feed
-                    await axios.get(this.nestObject.nestDevices[this.deviceID].nexus_api_http_server_url + "/get_image?width=" + request.width + "&uuid=" + this.nestObject.nestDevices[this.deviceID].camera_uuid, {responseType: "arraybuffer", headers: {"user-agent": USERAGENT, "accept" : "*/*", [this.nestObject.cameraAPI.key] : this.nestObject.cameraAPI.value}, timeout: NESTAPITIMEOUT/*, retry: 3, retryDelay: 2000 */})
+                    await axios.get(this.nestObject.nestDevices[this.deviceID].nexus_api_http_server_url + "/get_image?width=" + request.width + "&uuid=" + this.nestObject.nestDevices[this.deviceID].camera_uuid, {responseType: "arraybuffer", headers: {"user-agent": USERAGENT, "accept" : "*/*", [this.nestObject.cameraAPI.key] : this.nestObject.cameraAPI.value + this.nestObject.nestCameraToken}, timeout: NESTAPITIMEOUT/*, retry: 3, retryDelay: 2000 */})
                     .then(response => {
                     if (response.status == 200) {
                         image = response.data;
@@ -1318,7 +1320,7 @@ CameraClass.prototype.updateHomeKit = function(HomeKitAccessory, deviceData) {
         this.controller.setSpeakerMuted(deviceData.audio_enabled == false ? true : false);    // if audio is disabled, we'll mute speaker
 
         // Update any camera details if we have a Nexus streamer object created
-        this.NexusStreamer && this.NexusStreamer.update(this.nestObject.cameraAPI, deviceData);
+        this.NexusStreamer && this.NexusStreamer.update(this.nestObject.nestCameraToken, this.nestObject.nestTokenType, deviceData);
 
         // For non-HKSV enabled devices, we process activity zone changes
         if (deviceData.HKSV == false && (JSON.stringify(deviceData.activity_zones) != this.nestObject.nestDevices[this.deviceID].activity_zones)) {
@@ -1464,7 +1466,7 @@ CameraClass.prototype.__buildVideoStream = function(request, sessionInfo, callba
     var ffmpegVideo = spawn("ffmpeg", ffmpegCommand.split(" "), { env: process.env });
 
     ffmpegVideo.stderr.on("data", function (data) {
-        // Ffmpeg outputs via stderr for its console output. 
+        // ffmpeg outputs via stderr for its console output. 
         // We'll check for any output data that includes "frame", so we know ffmpeg is producing video output
         if (ffmpegStarted == false && data.toString().includes("frame=") == true) {
             ffmpegStarted = true;
@@ -1540,7 +1542,7 @@ CameraClass.prototype.__buildAudioStream = function(request, sessionInfo, callba
     ffmpegAudioReturn.on("exit", function (code, signal) {
     }.bind(this));
 
-    // Write our SDP configuration out
+    // Write out SDP configuration
     ffmpegAudioReturn.stdin.write("v=0\n"
         + "o=- 0 0 IN " + (sessionInfo.ipv6 ? "IP6" : "IP4") + " " + sessionInfo.address + "\n"
         + "s=Talk\n"
@@ -1574,9 +1576,11 @@ NestClass.prototype.initNestConnection = async function() {
                 .then(async (response) => {
                     if (response.status == 200) {
                         this.nestToken = response.data.jwt;
+                        this.nestCameraToken = response.data.jwt; // We'll put this in API header calls for cameras
+                        this.nestTokenType = "google";  // Google account
                         this.tokenExpire = Math.floor(new Date(response.data.claims.expirationTime) / 1000);   // Token expiry, should be 1hr
                         this.cameraAPI.key = "Authorization"; // We'll put this in API header calls for cameras
-                        this.cameraAPI.value = "Basic " + response.data.jwt; // We'll put this in API header calls for cameras
+                        this.cameraAPI.value = "Basic ";    // Note space at end of string.. Required
                     }
                 })
             }
@@ -1592,8 +1596,10 @@ NestClass.prototype.initNestConnection = async function() {
         .then((response) => {
             if (response.status == 200 && response.data && response.data.status == 0) {
                 this.nestToken = this.sessionToken; // Since we got camera details, this is a good token to use
+                this.nestCameraToken = response.data.items[0].session_token; // We'll put this in API header calls for cameras
+                this.nestTokenType = "nest";  // Nest account
                 this.cameraAPI.key = "cookie";  // We'll put this in API header calls for cameras
-                this.cameraAPI.value = "website_2=" + response.data.items[0].session_token; // We'll put this in API header calls for cameras
+                this.cameraAPI.value = "website_2=";
             }
         })
         .catch(error => {
@@ -1639,7 +1645,7 @@ NestClass.prototype.getNestData = async function() {
                     this.rawNestData.quartz[deviceID].alerts = [];  // no active alerts yet
                     this.rawNestData.quartz[deviceID].properties = [];  // no properties yet
                     this.rawNestData.quartz[deviceID].nexus_api_nest_domain_host = camera.nexus_api_http_server_url.replace(/dropcam.com/ig, "camera.home.nest.com");  // avoid extra API call to get this detail by simple domain name replace
-                    await axios.get(this.rawNestData.quartz[deviceID].nexus_api_nest_domain_host + "/cuepoint_category/" + deviceID, {headers: {"user-agent": USERAGENT, [this.cameraAPI.key] : this.cameraAPI.value} })
+                    await axios.get(this.rawNestData.quartz[deviceID].nexus_api_nest_domain_host + "/cuepoint_category/" + deviceID, {headers: {"user-agent": USERAGENT, [this.cameraAPI.key] : this.cameraAPI.value + this.nestCameraToken} })
                     .then(async (response)=> {
                         if (response.status && response.status == 200) {
                             // Insert activity zones into the nest structure
@@ -1650,7 +1656,7 @@ NestClass.prototype.getNestData = async function() {
                             })
                         }
                     })
-                    await axios.get(CAMERAAPIHOST + "/api/cameras.get_with_properties?uuid=" + deviceID, {headers: {"user-agent": USERAGENT, "Referer" : REFERER, [this.cameraAPI.key] : this.cameraAPI.value}, responseType: "json", timeout: NESTAPITIMEOUT})
+                    await axios.get(CAMERAAPIHOST + "/api/cameras.get_with_properties?uuid=" + deviceID, {headers: {"user-agent": USERAGENT, "Referer" : REFERER, [this.cameraAPI.key] : this.cameraAPI.value + this.nestCameraToken}, responseType: "json", timeout: NESTAPITIMEOUT})
                     .then((response) => {
                         if (response.status && response.status == 200) {
                             // Insert extra camera properties. We need this information to use with HomeKit Secure Video
@@ -1690,7 +1696,7 @@ NestClass.prototype.setNestStructure = async function(nestStructure, key, value,
 NestClass.prototype.setNestCamera = async function(deviceID, key, value) {
     var retValue = false;
     if (this.nestToken != "" && this.nestURL != "" && this.nestID != "" && deviceID != "") {
-        await axios.post(CAMERAAPIHOST + "/api/dropcams.set_properties", [key] + "=" + value + "&uuid=" + this.nestDevices[deviceID].camera_uuid, {headers: {"content-type": "application/x-www-form-urlencoded", "user-agent": USERAGENT, "Referer" : REFERER, [this.cameraAPI.key] : this.cameraAPI.value}, responseType: "json", timeout: NESTAPITIMEOUT})
+        await axios.post(CAMERAAPIHOST + "/api/dropcams.set_properties", [key] + "=" + value + "&uuid=" + this.nestDevices[deviceID].camera_uuid, {headers: {"content-type": "application/x-www-form-urlencoded", "user-agent": USERAGENT, "Referer" : REFERER, [this.cameraAPI.key] : this.cameraAPI.value + this.nestCameraToken}, responseType: "json", timeout: NESTAPITIMEOUT})
         .then((response) => {
             if (response.status == 200 && response.data.status == 0) {
                 this.debug && console.debug("[NEST] Successfully set Nest Camera element of '%s' to '%s' on '%s", key, value, deviceID);
@@ -1728,19 +1734,16 @@ NestClass.prototype.deviceSubscribe = function(deviceID, HomeKitAccessory, callb
                     }
                 }
             }
-            if (Object.keys(this.deviceEvents).length == 1) {
-                 // Start main loop for Nest structure changes as this the first device subscription
-                this.__nestAPISubscribe();
-            } else {
-                // Added another device, so cancel main loop for Nest structure changes. This will internally trigger a loop restart
-                this.cancel && this.cancel("Subscription update loop cancelled");
-            }
         }
 
         if (action == "remove") {
             if (typeof this.deviceEvents[deviceID] == "object") {
-                this.removeListener(deviceID, this.deviceEvents[deviceID].callback);    // Remove lister for device updates
+                this.removeAllListeners(deviceID, this.deviceEvents[deviceID].callback);    // Remove lister for device updates
                 delete this.deviceEvents[deviceID];
+
+                if (this.nestDevices[deviceID].device_type == "doorbell" || this.nestDevices[deviceID].device_type == "camera") {
+                    // Cancel camera polling loops
+                }
             }
             this.cancel && this.cancel("Subscription update loop cancelled");
         }
@@ -1773,7 +1776,7 @@ NestClass.prototype.__processNestData = function(nestData) {
                 this.nestDevices[thermostat.serial_number] = {};
                 this.nestDevices[thermostat.serial_number].device_type = "thermostat";  // nest thermostat
                 this.nestDevices[thermostat.serial_number].nest_device_structure = "device." + deviceID;
-                this.nestDevices[thermostat.serial_number].software_version = thermostat.current_version.replace(/-/g, "."); // fix software version for HomeKit
+                this.nestDevices[thermostat.serial_number].software_version = (typeof thermostat.current_version!= "undefined" ? thermostat.current_version.replace(/-/g, ".") : "0.0.0");
                 this.nestDevices[thermostat.serial_number].mac_address = tempMACAddress;    // Our created MAC address
                 this.nestDevices[thermostat.serial_number].current_humidity = thermostat.current_humidity;
                 this.nestDevices[thermostat.serial_number].temperature_scale = thermostat.temperature_scale;
@@ -2007,7 +2010,7 @@ NestClass.prototype.__processNestData = function(nestData) {
                 this.nestDevices[protect.serial_number].latest_alarm_test = protect.latest_manual_test_end_utc_secs;
                 this.nestDevices[protect.serial_number].self_test_in_progress = nestData.safety[protect.structure_id].manual_self_test_in_progress;
                 this.nestDevices[protect.serial_number].description = protect.hasOwnProperty("description") ? __makeValidHomeKitName(protect.description) : "";
-                this.nestDevices[protect.serial_number].software_version = protect.software_version.replace(/-/g, ".");    // fix software version for HomeKit
+                this.nestDevices[protect.serial_number].software_version = (typeof protect.software_version != "undefined" ? protect.software_version.replace(/-/g, ".") : "0.0.0");
                 this.nestDevices[protect.serial_number].ui_color_state = "grey";
                 if (protect.battery_health_state == 0 && protect.co_status == 0 && protect.smoke_status == 0) this.nestDevices[protect.serial_number].ui_color_state = "green";
                 if (protect.battery_health_state != 0 || protect.co_status == 1 || protect.smoke_status == 1) this.nestDevices[protect.serial_number].ui_color_state = "yellow";
@@ -2050,13 +2053,13 @@ NestClass.prototype.__processNestData = function(nestData) {
                 this.nestDevices[camera.serial_number].device_type = camera.camera_type == 12 ? "doorbell" : "camera";  // nest doorbell or camera
                 this.nestDevices[camera.serial_number].nest_device_structure = "quartz." + deviceID;
                 this.nestDevices[camera.serial_number].serial_number = camera.serial_number;
-                this.nestDevices[camera.serial_number].software_version = camera.software_version.replace(/-/g, "."); // fix software version for HomeKit
+                this.nestDevices[camera.serial_number].software_version = (typeof camera.software_version != "undefined" ? camera.software_version.replace(/-/g, ".") : "0.0.0");
                 this.nestDevices[camera.serial_number].model = camera.model;   // Full model name ie "Nest Doorbell (wired)" etc
                 this.nestDevices[camera.serial_number].mac_address = tempMACAddress;  // Our created MAC address;
                 this.nestDevices[camera.serial_number].description = camera.hasOwnProperty("description") ? __makeValidHomeKitName(camera.description) : "";
                 this.nestDevices[camera.serial_number].camera_uuid = deviceID;  // Can generate from .nest_device_structure anyway
                 this.nestDevices[camera.serial_number].direct_nexustalk_host = camera.direct_nexustalk_host;
-                this.nestDevices[camera.serial_number].websocket_nexustalk_host = camera.websocket_nexustalk_host;
+                this.nestDevices[camera.serial_number].websocket_nexustalk_host = camera.properties.websocket_nexustalk_host[0];
                 this.nestDevices[camera.serial_number].streaming_enabled = (camera.streaming_state.includes("enabled") ? true : false);
                 this.nestDevices[camera.serial_number].nexus_api_http_server_url = camera.nexus_api_http_server_url;
                 this.nestDevices[camera.serial_number].nexus_api_nest_domain_host = camera.nexus_api_http_server_url.replace(/dropcam.com/ig, "camera.home.nest.com");  // avoid extra API call to get this detail by simple domain name replace
@@ -2093,7 +2096,7 @@ NestClass.prototype.__processNestData = function(nestData) {
 NestClass.prototype.__nestCameraPolling = function(deviceID, action) {
     if (action == "alerts" && typeof this.nestDevices[deviceID] == "object") {
         // Get any alerts generated in the last 30 seconds
-        axios.get(this.nestDevices[deviceID].nexus_api_nest_domain_host + "/cuepoint/" + this.nestDevices[deviceID].camera_uuid + "/2?start_time=" + Math.floor((Date.now() / 1000) - 30), {headers: {"user-agent": USERAGENT, "Referer" : REFERER, [this.cameraAPI.key] : this.cameraAPI.value}, responseType: "json", timeout: 1000, retry: 3, retryDelay: 1000})
+        axios.get(this.nestDevices[deviceID].nexus_api_nest_domain_host + "/cuepoint/" + this.nestDevices[deviceID].camera_uuid + "/2?start_time=" + Math.floor((Date.now() / 1000) - 30), {headers: {"user-agent": USERAGENT, "Referer" : REFERER, [this.cameraAPI.key] : this.cameraAPI.value + this.nestCameraToken}, responseType: "json", timeout: 1000, retry: 3, retryDelay: 1000})
         .then((response) => {
             if (response.status == 200) {
                 // Filter out any alert which occured before we started this accessory
@@ -2132,7 +2135,7 @@ NestClass.prototype.__nestCameraPolling = function(deviceID, action) {
 
     if (action == "zones" && typeof this.nestDevices[deviceID] == "object" && this.nestDevices[deviceID].HKSV == false) {
         // Get current activity zones for non-HSKV enabled camera
-        axios.get(this.nestDevices[deviceID].nexus_api_nest_domain_host + "/cuepoint_category/" + this.nestDevices[deviceID].camera_uuid, {headers: {"user-agent": USERAGENT, "Referer" : REFERER, [this.cameraAPI.key] : this.cameraAPI.value}, responseType: "json", timeout: CAMERAZONEPOLLING})
+        axios.get(this.nestDevices[deviceID].nexus_api_nest_domain_host + "/cuepoint_category/" + this.nestDevices[deviceID].camera_uuid, {headers: {"user-agent": USERAGENT, "Referer" : REFERER, [this.cameraAPI.key] : this.cameraAPI.value + this.nestCameraToken}, responseType: "json", timeout: CAMERAZONEPOLLING})
         .then((response) => {
             if (response.status == 200) {
                 // Insert activity zones into the nest structure we've read before
@@ -2194,10 +2197,12 @@ NestClass.prototype.__nestAPISubscribe = async function() {
             // for doorbells/cameras, we need to subscribe to quartz
             subscribe.objects.push({"object_key" : "quartz." + subKey, "object_revision" : this.rawNestData["quartz"][subKey]["$version"], "object_timestamp": this.rawNestData["quartz"][subKey]["$timestamp"]});
         }
+    });
 
-        // Always subscribe to structure and where elements if we havent already included these
-        if (subscribe.objects.findIndex( ({ object_key }) => object_key === "structure." + structure) == -1 ) subscribe.objects.push({"object_key" : "structure." + structure, "object_revision" : this.rawNestData["structure"][structure]["$version"], "object_timestamp": this.rawNestData["structure"][structure]["$timestamp"]});
-        if (subscribe.objects.findIndex( ({ object_key }) => object_key === "where." + structure) == -1 ) subscribe.objects.push({"object_key" : "where." + structure, "object_revision" : this.rawNestData["where"][structure]["$version"], "object_timestamp": this.rawNestData["where"][structure]["$timestamp"]});
+    // Always subscribe to structure and associated where elements
+    this.rawNestData.structure && Object.entries(this.rawNestData.structure).forEach(([subkey]) => {
+        if (subscribe.objects.findIndex( ({ object_key }) => object_key === "structure." + subkey) == -1 ) subscribe.objects.push({"object_key" : "structure." + subkey, "object_revision" : this.rawNestData["structure"][subkey]["$version"], "object_timestamp": this.rawNestData["structure"][subkey]["$timestamp"]});
+        if (subscribe.objects.findIndex( ({ object_key }) => object_key === "where." + subkey) == -1 ) subscribe.objects.push({"object_key" : "where." + subkey, "object_revision" : this.rawNestData["where"][subkey]["$version"], "object_timestamp": this.rawNestData["where"][subkey]["$timestamp"]});
     });
 
     // Do subscription for the data we need from the Nest structure.. Timeout after 2mins if no data received, and if timed-out, rinse and repeat :-) 
@@ -2223,12 +2228,12 @@ NestClass.prototype.__nestAPISubscribe = async function() {
                     var oldDeviceList = this.rawNestData[mainKey][subKey].swarm.toString().split(',').map(String);
                     var newDeviceList = updatedData.value.swarm.toString().split(',').map(String);
                     for (var index in oldDeviceList) {
-                        if (!newDeviceList.includes(oldDeviceList[index])) {
+                        if (newDeviceList.includes(oldDeviceList[index]) == false && oldDeviceList[index] != "") {
                             tempDeviceList.push({"nestID": oldDeviceList[index], "action" : "remove"});    // Removed device
                         }
                     }
                     for (index in newDeviceList) {
-                        if (!oldDeviceList.includes(newDeviceList[index])) {
+                        if (oldDeviceList.includes(newDeviceList[index]) == false && newDeviceList[index] != "") {
                             tempDeviceList.push({"nestID": newDeviceList[index], "action" : "add"});    // Added device
                         }
                     }
@@ -2243,7 +2248,7 @@ NestClass.prototype.__nestAPISubscribe = async function() {
 
                     // Get extra camera properties if quartz change. We use this information with HomeKit Secure Video
                     if (mainKey == "quartz") {
-                        await axios.get(CAMERAAPIHOST + "/api/cameras.get_with_properties?uuid=" + subKey, {headers: {"user-agent": USERAGENT, "Referer" : REFERER, [this.cameraAPI.key] : this.cameraAPI.value}, responseType: "json", timeout: NESTAPITIMEOUT})
+                        await axios.get(CAMERAAPIHOST + "/api/cameras.get_with_properties?uuid=" + subKey, {headers: {"user-agent": USERAGENT, "Referer" : REFERER, [this.cameraAPI.key] : this.cameraAPI.value + this.nestCameraToken}, responseType: "json", timeout: NESTAPITIMEOUT})
                         .then((response) => {
                             if (response.status && response.status == 200) {
                                 this.rawNestData[mainKey][subKey].properties = response.data.items[0].properties;
@@ -2261,7 +2266,7 @@ NestClass.prototype.__nestAPISubscribe = async function() {
            
             // Process any updates for devices which aren't in the add/remove list
             this.nestDevices && Object.entries(this.nestDevices).forEach(([deviceID, deviceData]) => {
-                if (tempDeviceList.findIndex( ({ nestID }) => nestID === this.deviceEvents[deviceID].nestID) == -1) {
+                if (tempDeviceList.findIndex( ({ nestID }) => nestID === deviceData.nest_device_structure) == -1) {
                     if (typeof this.previousDevices[deviceID] == "object" && (JSON.stringify(deviceData) != JSON.stringify(this.previousDevices[deviceID]))) {
                         // data has changed, so notify HomeKit accessory of our updated Nest device data if have an event listener
                         this.deviceEvents[deviceID] && this.emit(deviceID, this.deviceEvents[deviceID].accessory, deviceData);
@@ -2269,19 +2274,19 @@ NestClass.prototype.__nestAPISubscribe = async function() {
                 }
             });
 
-            // Process any device additions/removals 
+            // Process any device additions/removals
             tempDeviceList.forEach(device => {
                 if (device.action == "add") {
-                    this.nestDevices && Object.entries(this.nestDevices).forEach(([deviceID, device]) => {
-                        if (device.nest_device_structure == nestDevice.nestID) {
-                            this.emit(NESTSTRUCTURECHANGE, this, device, "add");    // new device, so process addition to HomeKit
+                    this.nestDevices && Object.entries(this.nestDevices).forEach(([deviceID, deviceData]) => {
+                        if (deviceData.nest_device_structure == device.nestID) {
+                            this.emit(NESTSTRUCTURECHANGE, this, deviceData, "add");    // new device, so process addition to HomeKit
                         }
                     });
                 }
                 if (device.action == "remove") {
-                    this.previousDevices && Object.entries(this.previousDevices).forEach(([deviceID, device]) => {
-                        if (device.nest_device_structure == nestDevice.nestID) {
-                            this.emit(NESTSTRUCTURECHANGE, this, device, "remove");   // device has been removed
+                    this.previousDevices && Object.entries(this.previousDevices).forEach(([deviceID, deviceData]) => {
+                        if (deviceData.nest_device_structure == device.nestID) {
+                            this.emit(NESTSTRUCTURECHANGE, this, deviceData, "remove");   // device has been removed
                         }
                     });
                 }
@@ -2294,42 +2299,9 @@ NestClass.prototype.__nestAPISubscribe = async function() {
     .catch(async (error) => {
         if (axios.isCancel(error) == false && error.code !== 'ECONNABORTED') {
             if (error.response && error.response.status == 404) {
-                // Subscription failed with a 404 error "not found", so this could indicate device(s) have change. we'll check here also
-                await this.getNestData();  // get current data
-                this.__processNestData(this.rawNestData);   // and process it
-
-                // compare current vs previous devices to see if things have been added and/or removed
-                var oldDeviceList = Object.entries(this.previousDevices).toString().split(',').map(String);
-                var newDeviceList = Object.entries(this.nestDevices).toString().split(',').map(String);
-                for (var index in oldDeviceList) {
-                    if (!newDeviceList.includes(oldDeviceList[index])) {
-                        tempDeviceList.push({"nestID": oldDeviceList[index], "action" : "remove"});    // Removed device
-                    }
-                }
-                for (index in newDeviceList) {
-                    if (!oldDeviceList.includes(newDeviceList[index])) {
-                        tempDeviceList.push({"nestID": newDeviceList[index], "action" : "add"}); // Added device
-                    }
-                }
-                tempDeviceList = tempDeviceList.sort((a, b) => a - b);  // filter out duplicates
-
-                // Process any device additions/removals 
-                tempDeviceList.forEach(device => {
-                    if (device.action == "add") {
-                        this.nestDevices && Object.entries(this.nestDevices).forEach(([deviceID, device]) => {
-                            if (device.serial_number == nestDevice.nestID) {
-                                this.emit(NESTSTRUCTURECHANGE, this, device, "add");    // new device, so process addition to HomeKit
-                            }
-                        });
-                    }
-                    if (device.action == "remove") {
-                        this.previousDevices && Object.entries(this.previousDevices).forEach(([deviceID, device]) => {
-                            if (device.serial_number == nestDevice.nestID) {
-                                this.emit(NESTSTRUCTURECHANGE, this, device, "remove");   // device has been removed
-                            }
-                        });
-                    }
-                });
+                // URL not found
+                subscribeAgainTimeout = 5000;   // Since bad URL, try again after 5 seconds
+                this.debug && console.debug("[NEST] Nest subscription failed. URL not found");
             } else if (error.response && error.response.status == 400) {
                 // bad subscribe
                 subscribeAgainTimeout = 5000;   // Since bad subscribe, try again after 5 seconds
@@ -2644,9 +2616,11 @@ if (nest.sessionToken != "" || nest.refreshToken != "") {
             nest.__processNestData(nest.rawNestData);
             nest.nestDevices && Object.entries(nest.nestDevices).forEach(([deviceID, deviceData]) => {
                 processDeviceforHomeKit(nest, deviceData, "add");    
-            })
+            });
 
+            nest.debug && console.debug("[NEST] Started subscription process for Nest structure changes");
             nest.addListener(NESTSTRUCTURECHANGE, processDeviceforHomeKit); // Notifications for any device additions/removals in Nest structure
+            nest.__nestAPISubscribe();  // Start main loop for Nest structure changes
         })
     })
 } else {
