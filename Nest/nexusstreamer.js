@@ -117,6 +117,7 @@ const ClientType = {
 }
 
 
+// NeuxsStreamer object
 class NexusStreamer {
 	constructor(nestToken, tokenType, cameraData, debug) {
         this.ffmpeg = [];   // array of ffmpeg streams for the socket connection
@@ -168,7 +169,7 @@ NexusStreamer.prototype.startBuffering = function(milliseconds) {
 
         this.ffmpeg.push({type: "buffer", video: null, audio: null, size: milliseconds, buffer: []});   // push onto our ffmpeg streams array
         this.__close();
-        this.__connect();
+        this.__connect(this.camera.websocket_nexustalk_host);
         this.__startNexusData();   // start processing data
         this.debug && console.debug("[NEXUS] Started buffering from '%s' with size of '%s'", this.host, milliseconds);
     }
@@ -186,7 +187,7 @@ NexusStreamer.prototype.startLiveStream = function(sessionID, videoStream, audio
     if ((this.ffmpeg.findIndex(({ type }) => type == "buffer") == -1) && this.socket == null) {
         // We not doing any buffering and there isnt an active socket connection, so startup connection to nexus
         this.__close();
-        this.__connect();
+        this.__connect(this.camera.websocket_nexustalk_host);
         this.__startNexusData();
     }
     
@@ -226,7 +227,7 @@ NexusStreamer.prototype.startRecordStream = function(sessionID, ffmpegRecord, vi
     if (bufferIndex == -1 || this.socket == null) {
         // We not doing any buffering and/or there isnt an active socket connection, so startup connection to nexus
         this.__close();
-        this.__connect();
+        this.__connect(this.camera.websocket_nexustalk_host);
         this.__startNexusData();
     }
     if (bufferIndex != -1) {
@@ -269,7 +270,6 @@ NexusStreamer.prototype.stopRecordStream = function(sessionID) {
         this.sessionID = null;
         this.socket = null; // Kill the socket
         this.pendingMessages = []; // No more pending messages
-        this.host = this.camera.websocket_nexustalk_host;   // default back to initial host
     }
 }
 
@@ -290,7 +290,6 @@ NexusStreamer.prototype.stopLiveStream = function(sessionID) {
         this.sessionID = null;
         this.socket = null; // Kill the socket
         this.pendingMessages = []; // No more pending messages
-        this.host = this.camera.websocket_nexustalk_host;   // default back to initial host
     }
 }
 
@@ -310,7 +309,6 @@ NexusStreamer.prototype.stopBuffering = function() {
         this.sessionID = null;
         this.socket = null; // Kill the socket
         this.pendingMessages = []; // No more pending messages
-        this.host = this.camera.websocket_nexustalk_host;   // default back to initial host
     }
 }
 
@@ -323,14 +321,9 @@ NexusStreamer.prototype.update = function(nestToken, tokenType, cameraData) {
     }
     if (cameraData && cameraData.websocket_nexustalk_host != this.camera.websocket_nexustalk_host) {
         // host has changed, so treat as a re-direct if any video active
-        this.debug && console.log("[NEXUS] redirect requested from '%s' to '%s'", this.camera.websocket_nexustalk_host, cameraData.websocket_nexustalk_host);
         this.camera.websocket_nexustalk_host = cameraData.websocket_nexustalk_host;
-
         if (this.socket != null && this.ffmpeg.length >= 1) {
-            this.__stopNexusData();
-            this.__close();     // Close existing socket
-            this.__connect();   // Connect to new host
-            this.__startNexusData();    // Restart processing Nexus data
+            this.__handleRedirect(cameraData.websocket_nexustalk_host); // Do the redirect
         }
     }
     if (typeof cameraData.streaming_enabled == "boolean" && typeof cameraData.online == "boolean" && (this.camera.streaming_enabled != cameraData.streaming_enabled || this.camera.online != cameraData.online)) {
@@ -347,14 +340,17 @@ NexusStreamer.prototype.update = function(nestToken, tokenType, cameraData) {
     }
 }
 
-NexusStreamer.prototype.__connect = function () {
+NexusStreamer.prototype.__connect = function(host) {
     clearInterval(this.pingtimer);  // Clear ping timer if was running
 
     if (this.sessionID == null) this.sessionID = Math.floor(Math.random() * 100); // Random session ID
     if (this.camera.streaming_enabled == true && this.camera.online == true) {
+
+        if (typeof host == "string") this.host = host;  // Host specified, so update internal host name
+
         this.socket = new WebSocket("wss://" + this.host + "/nexustalk");
         this.socket.on("open", () => {
-            // Connected to Nexus server, so now need to authenticate ourselves
+            // Opened connection to Nexus server, so now need to authenticate ourselves
             this.debug && console.debug("[NEXUS] Establised connection to '%s'", this.host);
             this.__Authenticate(false);
 
@@ -382,9 +378,8 @@ NexusStreamer.prototype.__connect = function () {
                 // Since we still have ffmpeg streams registered, would indicate we didnt close the socket
                 // so re-connect and start processing data again
                 // update host to connected to??
-                this.host = this.camera.websocket_nexustalk_host;
                 this.__close();
-                this.__connect();
+                this.__connect(this.camera.websocket_nexustalk_host);
                 this.__startNexusData();
             }
         });
@@ -411,10 +406,12 @@ NexusStreamer.prototype.__close = function() {
         stopBuffer.writeVarintField(1, this.sessionID); // session ID
         this.__sendMessage(PacketType.STOP_PLAYBACK, stopBuffer.finish());
         if (this.socket.readyState != WebSocket.CLOSED) {
+            // Socket not closed, so close it
             this.socket.close();
         }
     }
     this.socket = null;
+    this.sessionID = null;  // Not an active session anymore
 }
 
 NexusStreamer.prototype.__startNexusData = function() {
@@ -510,6 +507,9 @@ NexusStreamer.prototype.__Authenticate = function(reauthorise) {
     // Authenticate over created socket connection
     var tokenBuffer = new protoBuf();
     var helloBuffer = new protoBuf();
+
+    this.authorised = false;    // We're nolonger authorised
+
     if (this.tokenType == "nest") {
         tokenBuffer.writeStringField(1, this.nestToken);   // Tag 1, session token, Nest auth accounts
         helloBuffer.writeStringField(4, this.nestToken);   // session token, Nest auth accounts
@@ -546,21 +546,32 @@ NexusStreamer.prototype.__AudioPayload = function(payload) {
 }
 
 NexusStreamer.prototype.__handleRedirect = function(payload) {
-    // Decode redirect packet to determine new host
-    var packet = payload.readFields(function(tag, obj, protoBuf) {
-        if (tag === 1) obj.new_host = protoBuf.readString();  // new host
-        else if (tag === 2) obj.is_transcode = protoBuf.readBoolean();
-    }, {new_host: "", is_transcode: false});
+    var redirectToHost = "";
+    
+    if (typeof payload == "object") {
+        // Payload parameter is an object, we'll assume its a payload packet
+        // Decode redirect packet to determine new host
+        var packet = payload.readFields(function(tag, obj, protoBuf) {
+            if (tag === 1) obj.new_host = protoBuf.readString();  // new host
+            else if (tag === 2) obj.is_transcode = protoBuf.readBoolean();
+        }, {new_host: "", is_transcode: false});
 
-    if (packet.new_host && packet.new_host != "") {
-        this.debug && console.log("[NEXUS] Redirect requested from '%s' to '%s'", this.host, packet.new_host);
-        this.host = packet.new_host;  // update internally stored host and connect it
+        redirectToHost = packet.new_host;
+    }
+    if (typeof payload == "string") {
+        // Payload parameter is a string, we'll assume this is a direct hostname
+        redirectToHost = payload;
+    }
 
-        if (this.socket != null) {
-            this.__close();     // Close existing socket
-            this.__connect();   // Connect to new host
+    if (redirectToHost != "") {
+        this.debug && console.log("[NEXUS] Redirect requested from '%s' to '%s'", this.host, redirectToHost);
+
+        // Setup listener for socket close event. Once socket is closed, we'll perform the redirect
+        this.socket && this.socket.on("close", () => {
+            this.__connect(redirectToHost);   // Connect to new host
             this.__startNexusData();    // Restart processing Nexus data
-        }
+        });
+        this.__close();     // Close existing socket    
     }
 }
 
@@ -638,11 +649,11 @@ NexusStreamer.prototype.__handlePlaybackEnd = function(payload) {
         else if (tag === 2) obj.reason = protoBuf.readVarint();
     }, {session_id: 0, reason: 0});
 
-    if (packet.reason != Reason.ERROR_TIME_NOT_AVAILABLE && packet.reason != 0) {
+    if (packet.reason != Reason.PLAY_END_SESSION_COMPLETE && packet.reason != 0) {
         setTimeout(() => {
             // Not a normal playback ended error, so restart playback after a short delay
-            this.debug && console.debug("[NEXUS] Playback ended on '%s' but will restart", this.host, packet.session_id, packet.reason);
-            this.__startNexusData();
+            this.debug && console.debug("[NEXUS] Playback ended on '%s' with error, but will be restarted", this.host, packet.session_id, packet.reason);
+            this.__startNexusData();    // Restart processing Nexus data
         }, 1000);
     } else {
         this.debug && console.debug("[NEXUS] Playback ended on '%s'", this.host, packet.session_id, packet.reason);
@@ -683,7 +694,7 @@ NexusStreamer.prototype.__handleNexusData = function(data) {
         var payload = new protoBuf(this.pendingBuffer.slice(headerLength, payloadEndPosition));
         switch (type) {
             case PacketType.OK : {
-                this.authorised = true;
+                this.authorised = true; // OK message, means we're connected and authorised to Nexus
                 this.__processMessages();
                 break;
             }
