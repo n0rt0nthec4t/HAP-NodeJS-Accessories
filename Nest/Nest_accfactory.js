@@ -54,6 +54,7 @@
 // -- ground work for subscribe updates
 // -- removed extra call to API for camera details. slightly faster updating
 // -- split out camera details/alerts into sperate polling loop
+// -- dynamically create h264 frames for camera off and camera offline status
 //
 // -- Nest Thermostat
 //      -- Migrated from NestThermostat_accfactory (v4) coding
@@ -97,7 +98,7 @@
 //    Access token can be view by logging in to https//home.nest.com on webbrowser then in going to https://home.nest.com/session  Seems access token expires every 30days
 //    so needs manually updating (haven't seen it expire yet.....)
 //
-// Version 15/5/2022
+// Version 18/5/2022
 // Mark Hulskamp
 
 module.exports = accessories = [];
@@ -119,6 +120,7 @@ var net = require("net");
 var ip = require("ip");
 var fs = require("fs");
 var {spawn} = require("child_process");
+var {spawnSync} = require("child_process");
 
 // Defines for the accessory
 const AccessoryName =  "Nest";
@@ -194,6 +196,14 @@ class NestClass extends EventEmitter {
             });
         }
 
+        // Create h264 frames for camera off/offline dynamically in video streams
+        this.debug && console.debug("[NEXUS] Creating camera off and camera offline image frame files");
+        var ffmpegCommand = "-hide_banner -loop 1 -i " + __dirname + "/Nest_camera_offline.jpg -vframes 1 -y -f h264 " + __dirname + "/Nest_camera_offline.h264";
+        spawnSync("ffmpeg", ffmpegCommand.split(" "), { env: process.env });
+        var ffmpegCommand = "-hide_banner -loop 1 -i " + __dirname + "/Nest_camera_off.jpg -vframes 1 -y -f h264 " + __dirname + "/Nest_camera_off.h264";
+        spawnSync("ffmpeg", ffmpegCommand.split(" "), { env: process.env });
+
+        // Time we create this object. Used to filter camera alert events out before this started
         this.startTime = Math.floor(new Date() / 1000);
     }
 }
@@ -913,15 +923,19 @@ CameraClass.prototype.addDoorbellCamera = function(HomeKitAccessory, thisService
         });
         
         this.controller.recordingManagement.operatingModeService.getCharacteristic(Characteristic.HomeKitCameraActive).on("set", (value, callback) => {
-            var setValue = (value == Characteristic.HomeKitCameraActive.ON);
-            if (setValue != this.nestObject.nestDevices[this.deviceID].properties['streaming.enabled']) {
-                // Camera state does not reflect HKSV requested state, so fix
-                this.nestObject.nestDevices[this.deviceID].properties['streaming.enabled'] = setValue;  // Store change internally as takes sometime to update Nest
-                this.nestObject.setNestCamera(this.deviceID, "streaming.enabled", setValue)
-            }
-            if (setValue == false) {
-                // Clear any inflight motion
-                this.MotionServices[0].service.updateCharacteristic(Characteristic.MotionDetected, false);
+            if (value != this.controller.recordingManagement.operatingModeService.getCharacteristic(Characteristic.HomeKitCameraActive).value) {
+                // Make sure only updating status if HomeKit value *actually changes*
+                var setValue = (value == Characteristic.HomeKitCameraActive.ON);
+                if (setValue != this.nestObject.nestDevices[this.deviceID].streaming_enabled) {
+                    // Camera state does not reflect HKSV requested state, so fix
+                    this.nestObject.nestDevices[this.deviceID].properties['streaming.enabled'] = setValue;  // Store change internally as takes sometime to update Nest
+                    this.nestObject.nestDevices[this.deviceID].streaming_enabled = setValue;  // Store change internally as takes sometime to update Nest
+                    this.nestObject.setNestCamera(this.deviceID, "streaming.enabled", setValue)
+                }
+                if (setValue == false) {
+                    // Clear any inflight motion
+                    this.MotionServices[0].service.updateCharacteristic(Characteristic.MotionDetected, false);
+                }
             }
             callback();
         });
@@ -1239,7 +1253,7 @@ CameraClass.prototype.prepareStream = async function(request, callback) {
 
     // setup for splitting audio stream into seperate parts to allow two/way audio
     // only need if two/way audio enabled
-    if (this.nestObject.nestDevices[this.deviceID].audio_enabled && this.twoWayAudio == true) {
+    if (this.nestObject.nestDevices[this.deviceID].audio_enabled == true && this.twoWayAudio == true) {
         sessionInfo.rtpSplitter = dgram.createSocket("udp4");
         sessionInfo.rtpSplitter.on("error", (error) => {
             sessionInfo.rtpSplitter.close();
@@ -1342,7 +1356,7 @@ CameraClass.prototype.handleStreamRequest = async function (request, callback) {
                 }
             });
 
-            // We only create teh ffmpeg process if twoway audio is supported AND audio enabled on doorbell/camera
+            // We only create the ffmpeg process if twoway audio is supported AND audio enabled on doorbell/camera
             if (this.ongoingSessions[request.sessionID].rtpSplitter != null) {
                 var ffmpegCommand = "-hide_banner"
                     + " -protocol_whitelist pipe,udp,rtp,file,crypto"
@@ -1418,6 +1432,11 @@ CameraClass.prototype.updateHomeKit = function(HomeKitAccessory, deviceData) {
     if (typeof deviceData == 'object' && this.updatingHomeKit == false) {
         HomeKitAccessory.getService(Service.AccessoryInformation).updateCharacteristic(Characteristic.FirmwareRevision, deviceData.software_version);   // Update firmware version
         this.controller.setSpeakerMuted(deviceData.audio_enabled == false ? true : false);    // if audio is disabled, we'll mute speaker
+
+        if (deviceData.HKSV == true) {
+            // Update camera off/on status for HKSV from Nest
+            this.controller.recordingManagement.operatingModeService.updateCharacteristic(Characteristic.ManuallyDisabled, (deviceData.streaming_enabled == true ? Characteristic.ManuallyDisabled.ENABLED : Characteristic.ManuallyDisabled.DISABLED));
+        }
 
         // Update any camera details if we have a Nexus streamer object created
         this.NexusStreamer && this.NexusStreamer.update(this.nestObject.nestCameraToken, this.nestObject.nestTokenType, deviceData);
