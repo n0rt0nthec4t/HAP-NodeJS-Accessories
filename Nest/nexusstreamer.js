@@ -5,7 +5,7 @@
 // Cleaned up/recoded
 //
 // Mark Hulskamp
-// 17/5/2022
+// 21/5/2022
 //
 // done
 // -- switching camera stream on/off - going from off to on doesn't restart stream from Nest
@@ -20,7 +20,7 @@
 // todo
 // -- When camera goes offline, we don't get notified straight away and video stream stops. Perhaps timer to go to camera off image if no data receieve in past 15 seconds?
 // -- When first called after starting, get a green screen for about 1 second. Everything is fine after that <- not seen in ages
-//    **Think know what this issue is. When outputting a new stream, need to align to H264 SPS frame (which starts with 0x67)
+//    **Think know what this issue is. When outputting a new stream, need to align to H264 SPS frame
 // -- get snapshot image for current stream if active
 // -- audio echo with return audio
 // -- fix switching camera off/offline image frames to streams. Broken atm
@@ -121,6 +121,16 @@ const ClientType = {
     WEB : 3
 }
 
+const H264FrameTyes = {
+    STAP_A : 24,
+    FU_A : 28,
+    NON_IDR : 1,
+    IDR : 5,
+    SEI : 6,
+    SPS : 7,
+    PPS : 8,
+    DELIMITER : 9
+}
 
 // NeuxsStreamer object
 class NexusStreamer {
@@ -197,7 +207,7 @@ NexusStreamer.prototype.startLiveStream = function(sessionID, videoStream, audio
     }
     
     // Should have an active connection here now, so can add video/audio stream handles for our ffmpeg router to handle
-    var index = (this.ffmpeg.push({type: "live", id: sessionID, video: videoStream, audio: audioStream, return: audioReturnStream, timeout: null, aligned: false}) - 1);
+    var index = (this.ffmpeg.push({type: "live", id: sessionID, video: videoStream, audio: audioStream, return: audioReturnStream, timeout: null, aligned: false, time: Date.now()}) - 1);
 
     // Setup audio return streaming if configured and allowed
     if (audioReturnStream != null) {
@@ -256,7 +266,7 @@ NexusStreamer.prototype.stopRecordStream = function(sessionID) {
     // If we have no more streams active, we'll close the socket to nexus
     if (this.ffmpeg.length == 0) {
         // Don't have any other streams going, so can close the active socket connection
-        this.__close();
+        this.__close(true);
 
         this.sessionID = null;
         this.socket = null; // Kill the socket
@@ -276,7 +286,7 @@ NexusStreamer.prototype.stopLiveStream = function(sessionID) {
     // If we have no more streams active, we'll close the socket to nexus
     if (this.ffmpeg.length == 0) {
         // Don't have any other streams going, so can close the active socket connection
-        this.__close();
+        this.__close(true);
 
         this.sessionID = null;
         this.socket = null; // Kill the socket
@@ -295,7 +305,7 @@ NexusStreamer.prototype.stopBuffering = function() {
     // If we have no more streams active, we'll close the socket to nexus
     if (this.ffmpeg.length == 0) {
         // Don't have any other streams going, so can close the active socket connection
-        this.__close();
+        this.__close(true); 
 
         this.sessionID = null;
         this.socket = null; // Kill the socket
@@ -325,7 +335,7 @@ NexusStreamer.prototype.update = function(nestToken, tokenType, cameraData) {
             this.camera.online = cameraData.online;
             this.camera.streaming_enabled = cameraData.streaming_enabled;
             if ((this.camera.online == false || this.camera.streaming_enabled == false) && this.socket != null) {
-                this.__close(); // as offline or streaming not enabled, close socket
+                this.__close(true); // as offline or streaming not enabled, close socket
             }
             if ((this.camera.online == true && this.camera.streaming_enabled == true) && (this.socket == null && this.ffmpeg.length >= 1)) {
                 this.__connect(this.camera.websocket_nexustalk_host);   // Connect to Nexus for stream
@@ -362,18 +372,17 @@ NexusStreamer.prototype.__connect = function(host) {
 
         this.socket.on("error", (error) => {
             // Socket error. Do we do something??
+            this.debug && console.debug("[NEXUS] Socket error on '%s'", this.host, error);
         });
 
         this.socket.on("close", () => {
             clearInterval(this.pingtimer);    // Clear ping timer
             this.debug && console.debug("[NEXUS] Socket closed to '%s'", this.host);
-
             if (this.socket != null && this.socket.readyState == WebSocket.CLOSED && this.ffmpeg.length >= 1) {
                 // Since we still have ffmpeg streams registered, would indicate we didnt close the socket
                 // so re-connect and start processing data again
                 // update host to connected to??
-                //this.__close();
-                this.__connect(this.camera.websocket_nexustalk_host);
+                this.__connect();
                 this.__startNexusData();
             }
         });
@@ -393,12 +402,15 @@ NexusStreamer.prototype.__connect = function(host) {
     }, TIMERINTERVAL);
 }
 
-NexusStreamer.prototype.__close = function() {
+NexusStreamer.prototype.__close = function(sendStop) {
     // Close an authenicated socket stream gracefully
     if (this.socket != null) {
-        var stopBuffer = new protoBuf();
-        stopBuffer.writeVarintField(1, this.sessionID); // session ID
-        this.__sendMessage(PacketType.STOP_PLAYBACK, stopBuffer.finish());
+        if (sendStop == true) {
+            // Send a notifcation to nexus we're finished playback
+            var stopBuffer = new protoBuf();
+            stopBuffer.writeVarintField(1, this.sessionID); // session ID}
+            this.__sendMessage(PacketType.STOP_PLAYBACK, stopBuffer.finish());
+        }
         if (this.socket.readyState != WebSocket.CLOSED) {
             // Socket not closed, so close it
             this.socket.close();
@@ -454,8 +466,9 @@ NexusStreamer.prototype.__ffmpegRouter = function(type, data) {
     // Done any buffering required, so now handle any ffmpeg "live" or "recording" streams
     this.ffmpeg.forEach(ffmpeg => {
         if (ffmpeg.type == "live") {
-            // Align to video frame data staring with 0x67 (SPS). Should allow cleaner ffmpeg processing
-            if (type == "video" && data[0] == 0x67) ffmpeg.aligned = true;
+            // Align to h264 SPS frame before we send any data on. Should allow cleaner ffmpeg processing
+            // Does make starting live stream in HomeKit slightly slower
+            if (type == "video" && (data[0] & 0x1f) == H264FrameTyes.SPS) ffmpeg.aligned = true;
             if (ffmpeg.aligned == true) {
                 if (type == "video" && ffmpeg.video != null) {
                     // H264 NAL Units "0001" are required to be added to beginning of any video data we output
@@ -467,29 +480,26 @@ NexusStreamer.prototype.__ffmpegRouter = function(type, data) {
             }
         }
         if (ffmpeg.type == "record") {
-            if (ffmpeg.empty == true) {
+            if (ffmpeg.empty == true && bufferIndex != -1) {
                 // Empty the current buffer to the record stream, before sending anything new
-                if (bufferIndex!= -1) {
-                    this.debug && console.debug("[NEXUS] Record stream requested all buffered data first. Buffered elements are '%s'", this.ffmpeg[bufferIndex].buffer.length);
+                ffmpeg.empty = false;
+                this.debug && console.debug("[NEXUS] Record stream requested all buffered data first. Buffered elements are '%s'", this.ffmpeg[bufferIndex].buffer.length);
 
-                    for (var bufferData = this.ffmpeg[bufferIndex].buffer.shift(); bufferData; bufferData = this.ffmpeg[bufferIndex].buffer.shift()) {
-                        // Align to video frame data staring with 67. Should allow cleaner ffmpeg processing
-                        if (bufferData.type == "video" && bufferData.data[0] == 0x67) ffmpeg.aligned = true;
-                        if (ffmpeg.aligned == true) {
-                            // Should be aligned to buffer video sequence of 0x67 (SPS), 0x68 (PPS), 0x65 frames as receieved from nexus stream
-                            // Send anything in buffer from this position
-                            if (bufferData.type == "video" && ffmpeg.video != null) {
-                                // H264 NAL Units "0001" are required to be added to beginning of any video data
-                                ffmpeg.video.write(Buffer.concat([Buffer.from([0x00, 0x00, 0x00, 0x01]), bufferData.data]));
-                            }
-                            if (bufferData.type == "audio" && ffmpeg.audio != null) {
-                                ffmpeg.audio.write(bufferData.data);
-                            }
+                for (var bufferData = this.ffmpeg[bufferIndex].buffer.shift(); bufferData; bufferData = this.ffmpeg[bufferIndex].buffer.shift()) {
+                    // Align to h264 SPS frame before we send any data on. Should allow cleaner ffmpeg processing
+                    if (bufferData.type == "video" && (bufferData.data[0] & 0x1f) == H264FrameTyes.SPS) ffmpeg.aligned = true;
+                    if (ffmpeg.aligned == true) {
+                        // Should be aligned to buffer h264 frame video sequence of SPS, PPS and IDR frames as receieved from nexus stream
+                        // Send anything in buffer from this position
+                        if (bufferData.type == "video" && ffmpeg.video != null) {
+                            // H264 NAL Units "0001" are required to be added to beginning of any video data
+                            ffmpeg.video.write(Buffer.concat([Buffer.from([0x00, 0x00, 0x00, 0x01]), bufferData.data]));
+                        }
+                        if (bufferData.type == "audio" && ffmpeg.audio != null) {
+                            ffmpeg.audio.write(bufferData.data);
                         }
                     }
-                    // Buffer should be empty now
                 }
-                ffmpeg.empty = false;   // Done emptying buffer
             } else {
                 // Since didnt need to empty buffer first, send on any new data
                 if (type == "video" && ffmpeg.video != null) {
@@ -608,7 +618,7 @@ NexusStreamer.prototype.__handleRedirect = function(payload) {
             this.__connect(redirectToHost);   // Connect to new host
             this.__startNexusData();    // Restart processing Nexus data
         });
-        this.__close();     // Close existing socket    
+        this.__close(true);     // Close existing socket    
     }
 }
 
@@ -646,10 +656,9 @@ NexusStreamer.prototype.__handlePlaybackBegin = function(payload) {
         });
 
         // Since this is the beginning of playback, clear any active buffers contents
+        // Should only be one buffer, but just in case, search all
         this.ffmpeg.forEach(ffmpeg => {
-            if (ffmpeg.type == "buffer") {
-                ffmpeg.buffer = []; // empty buffer
-            }
+            if (ffmpeg.type == "buffer") ffmpeg.buffer = []; // empty buffer
         });
     }
 }
@@ -697,9 +706,10 @@ NexusStreamer.prototype.__handlePlaybackEnd = function(payload) {
             break;
         }
 
+        case Reason.ERROR_TRANSCODE_NOT_AVAILABLE : 
         case Reason.PLAY_END_SESSION_COMPLETE : {
             // Lets restart playback
-            this.debug && console.debug("[NEXUS] Playback ended on '%s'. We'll attempt to restart", this.host);
+            this.debug && console.debug("[NEXUS] Playback ended on '%s'. We'll attempt to restart", this.host, packet.reason);
             this.__connect();   // Re-connect to existing host
             this.__startNexusData();    // Restart processing Nexus data
             break;
@@ -707,7 +717,9 @@ NexusStreamer.prototype.__handlePlaybackEnd = function(payload) {
 
         default : {
             // Another kind of error.
-            this.debug && console.debug("[NEXUS] Playback ended on with error '%s'", this.host, packet.session_id, packet.reason);
+            this.debug && console.debug("[NEXUS] Playback ended on with error '%s'. We'll attempt to restart", this.host, packet.reason);
+            //this.__connect(this.camera.websocket_nexustalk_host);   // Re-connect
+            //this.__startNexusData();    // Restart processing Nexus data
             break;
         }
     }
@@ -732,61 +744,64 @@ NexusStreamer.prototype.__handleNexusError = function(payload) {
 NexusStreamer.prototype.__handleNexusData = function(data) {
     // Process the rawdata from our socket connection and convert into nexus packets to take action against
     this.pendingBuffer = (this.pendingBuffer == null ? data : Buffer.concat([this.pendingBuffer, data]));
-    var type = this.pendingBuffer.readUInt8();
-    var headerLength = 3;
-    var length = this.pendingBuffer.readUInt16BE(1);
+    if (this.pendingBuffer.length >= 3) {
+        // Ensure we have a minimun length in the buffer to read header details
+        var type = this.pendingBuffer.readUInt8();
+        var headerLength = 3;
+        var length = this.pendingBuffer.readUInt16BE(1);
 
-    if (type == PacketType.LONG_PLAYBACK_PACKET) {
-        // Adjust header size and data length based upon packet type
-        headerLength = 5;
-        length = this.pendingBuffer.readUInt32BE(1);
-    }
-
-    var payloadEndPosition = length + headerLength;
-    if (this.pendingBuffer.length >= payloadEndPosition) {
-        var payload = new protoBuf(this.pendingBuffer.slice(headerLength, payloadEndPosition));
-        switch (type) {
-            case PacketType.OK : {
-                this.authorised = true; // OK message, means we're connected and authorised to Nexus
-                this.__processMessages();
-                break;
-            }
-    
-            case PacketType.ERROR : {
-                this.__handleNexusError(payload);
-                break;
-            }
-    
-            case PacketType.PLAYBACK_BEGIN : {
-                this.__handlePlaybackBegin(payload);
-                break;
-            }
-    
-            case PacketType.PLAYBACK_END : {
-                this.__handlePlaybackEnd(payload);
-                break;
-            }
-    
-            case PacketType.LONG_PLAYBACK_PACKET :
-            case PacketType.PLAYBACK_PACKET : {
-                this.__handlePlaybackPacket(payload);
-                break;
-            }
-
-            case PacketType.REDIRECT : {
-                this.__handleRedirect(payload);
-                break;
-            }
-
-            default: {
-                // We didn't process this type of packet
-                break
-            }
+        if (type == PacketType.LONG_PLAYBACK_PACKET) {
+            // Adjust header size and data length based upon packet type
+            headerLength = 5;
+            length = this.pendingBuffer.readUInt32BE(1);
         }
-        var remainingData = this.pendingBuffer.slice(payloadEndPosition);
-        this.pendingBuffer = null;
-        if (remainingData.length > 0) {
-            this.__handleNexusData(remainingData);  // Maybe not do this recursive???
+
+        var payloadEndPosition = length + headerLength;
+        if (this.pendingBuffer.length >= payloadEndPosition) {
+            var payload = new protoBuf(this.pendingBuffer.slice(headerLength, payloadEndPosition));
+            switch (type) {
+                case PacketType.OK : {
+                    this.authorised = true; // OK message, means we're connected and authorised to Nexus
+                    this.__processMessages();
+                    break;
+                }
+        
+                case PacketType.ERROR : {
+                    this.__handleNexusError(payload);
+                    break;
+                }
+        
+                case PacketType.PLAYBACK_BEGIN : {
+                    this.__handlePlaybackBegin(payload);
+                    break;
+                }
+        
+                case PacketType.PLAYBACK_END : {
+                    this.__handlePlaybackEnd(payload);
+                    break;
+                }
+        
+                case PacketType.LONG_PLAYBACK_PACKET :
+                case PacketType.PLAYBACK_PACKET : {
+                    this.__handlePlaybackPacket(payload);
+                    break;
+                }
+
+                case PacketType.REDIRECT : {
+                    this.__handleRedirect(payload);
+                    break;
+                }
+
+                default: {
+                    // We didn't process this type of packet
+                    break
+                }
+            }
+            var remainingData = this.pendingBuffer.slice(payloadEndPosition);
+            this.pendingBuffer = null;
+            if (remainingData.length > 0) {
+                this.__handleNexusData(remainingData);  // Maybe not do this recursive???
+            }
         }
     }
 }
