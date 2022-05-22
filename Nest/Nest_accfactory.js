@@ -55,6 +55,7 @@
 // -- removed extra call to API for camera details. slightly faster updating
 // -- split out camera details/alerts into sperate polling loop
 // -- dynamically create h264 frames for camera off and camera offline status
+// -- configuration options to adjust cooldown times for doorbell press, motion and person events
 //
 // -- Nest Thermostat
 //      -- Migrated from NestThermostat_accfactory (v4) coding
@@ -92,13 +93,14 @@
 //      -- Tested only with Nest Hello & Cam Outdoor, but should be fine for other Nest Cams
 //      -- HomeKit Secure Video (HKSV) - support video and audio recording
 //      -- Refinements to ffmpeg streaming process.. Video/Audio now in one process
+//      -- Added in motion history recording. Appears in Eve Home now
 //
 // bugs
 // -- Sarting Jan 2020, google has enabled reCAPTCHA for Nest Accounts. Modfied code to no longer use user/name password login, but access token
 //    Access token can be view by logging in to https//home.nest.com on webbrowser then in going to https://home.nest.com/session  Seems access token expires every 30days
 //    so needs manually updating (haven't seen it expire yet.....)
 //
-// Version 18/5/2022
+// Version 23/5/2022
 // Mark Hulskamp
 
 module.exports = accessories = [];
@@ -131,9 +133,6 @@ const CAMERAAPIHOST = "https://webapi.camera.home.nest.com";
 const NESTAPITIMEOUT = 10000;                       // Calls to Nest API timeout
 const CAMERAALERTPOLLING = 2000;                    // Camera alerts polling timer
 const CAMERAZONEPOLLING = 30000;                    // Camera zones changes polling timer
-const DOORBELLCOOLDOWN = 60000;                     // Cooldown for Nest doorbell button pressed
-const PERSONCOOLDOWN = 120000;                      // Cooldown for Nest camera detecting a person/face
-const MOTIONCOOLDOWN = 60000;                       // Cooldown for HomeKit Secure Video motion recording
 const LOWBATTERYLEVEL = 10;                         // Low battery level percentage
 
 const NESTSTRUCTURECHANGE = "structure";            // Nest structure change event
@@ -143,8 +142,6 @@ class NestClass extends EventEmitter {
 	constructor() {
         super();
 
-        this.refreshToken = "";                     // Session token. Used for Nest accounts
-        this.sessionToken = "";                     // Refresh token. Used for Google accounts
         this.nestToken = "";                        // Access token for Nest API requests
         this.nestCameraToken = "";                  // Access token for Camera API requests
         this.nestTokenType = "";                    // Type of account we authorised to Nest with
@@ -160,10 +157,18 @@ class NestClass extends EventEmitter {
         this.excludedDevices = [];                  // array of excluded devices (by serial number). We don't process these devices
         this.extraOptions = {};                     // Extra options per device to inject into Nest data stream
         this.cancel = null;
-        this.debug = false;                         // Enable debug output, no by default
-        this.HomeKitSecureVideo = false;            // Enable HKSV for all camera/doorbells, no by default
-        this.HomeKitSecureVideoBufSize = 0;         // Milliseconds seconds to hold in buffer. Pre-buffering disabled by default with value 0
         this.startTime = null;                      // Time we started the object. used to filter out old alerts
+
+        this.config = {                             // Configuration object
+            debug : false,                          // Enable debug output, no by default
+            refreshToken : "",                      // Session token. Used for Nest accounts
+            sessionToken : "",                      // Refresh token. Used for Google accounts
+            HKSV : false,                           // Enable HKSV for all camera/doorbells, no by default
+            HKSVPreBuffer : 15000,                  // Milliseconds seconds to hold in buffer. default is 15secs. using 0 disables pre-buffer
+            doorbellCooldown : 60000,               // Default cooldown period for doorbell button press (1min/60secs)
+            motionCooldown : 60000,                 // Default cooldown period for motion detected (1min/60secs)
+            personCooldown : 120000,                // Default cooldown person for person detected (2mins/120secs)
+        };
 
         // Load configuration
         if (fs.existsSync(__dirname + "/Nest_config.json")) {
@@ -171,16 +176,48 @@ class NestClass extends EventEmitter {
 
             config && Object.entries(config).forEach(([key, value]) => {
                 // Process configuration items
-                if (key.toUpperCase() == "SESSIONTOKEN") this.sessionToken = value;  // Nest accounts Session token to use for Nest calls
-                if (key.toUpperCase() == "REFRESHTOKEN") this.refreshToken = value;  // Google accounts refresh token to use for Nest calls
-                if (key.toUpperCase() == "DEBUG" && typeof value == "boolean") this.debug = value;  // Debugging output
-                if (key.toUpperCase() == "HKSV" && typeof value == "boolean") this.HomeKitSecureVideo = value;    // default for HomeKit Secure Video
-                if (key.toUpperCase() == "HKSVPREBUFFER" && typeof value == "number") this.HomeKitSecureVideoBufSize = value;   // default pre-buffer sizing
+                if (key.toUpperCase() == "SESSIONTOKEN") this.config.sessionToken = value;  // Nest accounts Session token to use for Nest calls
+                if (key.toUpperCase() == "REFRESHTOKEN") this.config.refreshToken = value;  // Google accounts refresh token to use for Nest calls
+                if (key.toUpperCase() == "DEBUG" && typeof value == "boolean") this.config.debug = value;  // Debugging output
+                if (key.toUpperCase() == "HKSV" && typeof value == "boolean") this.config.HKSV = value;    // Global HomeKit Secure Video?
+                if (key.toUpperCase() == "HKSVPREBUFFER" && typeof value == "number") {
+                    if (value < 1000) value = value * 1000;  // If less 1000, assume seconds value passed in, so convert to milliseconds
+                    this.config.HKSVPreBuffer = value;   // Global HKSV pre-buffer sizing
+                }
+                if (key.toUpperCase() == "DOORBELLCOOLDOWN" && typeof value == "number") {
+                    if (value < 1000) value = value * 1000;  // If less 1000, assume seconds value passed in, so convert to milliseconds
+                    this.config.doorbellCooldown = value;   // Global doorbell press cooldown time
+                }              
+                if (key.toUpperCase() == "MOTIONCOOLDOWN" && typeof value == "number") {
+                    if (value < 1000) value = value * 1000;  // If less 1000, assume seconds value passed in, so convert to milliseconds
+                    this.config.motionCooldown = value;   // Global motion detected cooldown time
+                }
+                if (key.toUpperCase() == "PERSONCOOLDOWN" && typeof value == "number") {
+                    if (value < 1000) value = value * 1000;  // If less 1000, assume seconds value passed in, so convert to milliseconds
+                    this.config.personCooldown = value;   // Global person detected cooldown time
+                }
                 if (typeof value == "object") {
                     // Assume since key value is an object, its a device configuration for matching serial number
                     this.extraOptions[key.toUpperCase()] = {};
                     Object.entries(value).forEach(([subKey, value]) => {
                         if (subKey.toUpperCase() == "EXCLUDE" && typeof value == "boolean" && value == true) this.excludedDevices.push(key.toUpperCase());    // Push this devices serial number onto our list
+                        if (subKey.toUpperCase() == "HKSV" && typeof value == "boolean") this.extraOptions[key.toUpperCase()]["HKSV"] = value;    // HomeKit Secure Video for this device?
+                        if (subKey.toUpperCase() == "HKSVPREBUFFER" && typeof value == "number") {
+                            if (value < 1000) value = value * 1000;  // If less 1000, assume seconds value passed in, so convert to milliseconds
+                            this.extraOptions[key.toUpperCase()]["HKSVPreBuffer"] = value;   // HKSV pre-buffer sizing for this device
+                        }
+                        if (subKey.toUpperCase() == "DOORBELLCOOLDOWN" && typeof value == "number") {
+                            if (value < 1000) value = value * 1000;  // If less 1000, assume seconds value passed in, so convert to milliseconds
+                            this.extraOptions[key.toUpperCase()]["doorbellCooldown"] = value;   // Doorbell press cooldown time for this device
+                        }              
+                        if (subKey.toUpperCase() == "MOTIONCOOLDOWN" && typeof value == "number") {
+                            if (value < 1000) value = value * 1000;  // If less 1000, assume seconds value passed in, so convert to milliseconds
+                            this.extraOptions[key.toUpperCase()]["motionCooldown"] = value;   // Motion detected cooldown time for this device
+                        }
+                        if (subKey.toUpperCase() == "PERSONCOOLDOWN" && typeof value == "number") {
+                            if (value < 1000) value = value * 1000;  // If less 1000, assume seconds value passed in, so convert to milliseconds
+                            this.extraOptions[key.toUpperCase()]["personCooldown"] = value;   // Person detected cooldown time for this device
+                        }
                         if (subKey.split('.')[0].toUpperCase() == "OPTION" && subKey.split('.')[1]) {
                             // device options we'll insert into the Nest data for non excluded devices
                             // also allows us to override existing Nest data for the device, such as MAC address etc
@@ -196,8 +233,8 @@ class NestClass extends EventEmitter {
             });
         }
 
-        // Create h264 frames for camera off/offline dynamically in video streams
-        this.debug && console.debug("[NEXUS] Creating camera off and camera offline image frame files");
+        // Create h264 frames for camera off/offline dynamically in video streams. Only required for non-HKSV video devices
+        this.config.debug && console.debug("[NEXUS] Creating camera off and camera offline image frame files");
         var ffmpegCommand = "-hide_banner -loop 1 -i " + __dirname + "/Nest_camera_offline.jpg -vframes 1 -y -f h264 " + __dirname + "/Nest_camera_offline.h264";
         spawnSync("ffmpeg", ffmpegCommand.split(" "), { env: process.env });
         var ffmpegCommand = "-hide_banner -loop 1 -i " + __dirname + "/Nest_camera_off.jpg -vframes 1 -y -f h264 " + __dirname + "/Nest_camera_off.h264";
@@ -257,13 +294,13 @@ function CameraClass() {
     this.pendingSessions = [];                      
     this.ongoingSessions = [];
     this.cachedSnapshot = null;                 // Cached camera snapshot from stream
-
     this.doorbellTimer = null;                  // Cooldown timer for doorbell events
     this.personTimer = null;                    // Cooldown timer for person/face events
     this.motionTimer = null;                    // Cooldown timer for motion events
     this.twoWayAudio = false;                   // Do we support twoway audio
     this.NexusStreamer =  null;                 // Object for the Nexus Streamer. Created when adding doorbell/camera
     this.events = null;                         // Event emitter for this doorbell/camera
+    this.historyService = null;                 // History logging service
 
     // HKSV stuff
     this.HKSVDoRecordings = null;               // Tracks updateRecordingActive. default is unknown state, but HomeKit will select
@@ -572,7 +609,7 @@ ThermostatClass.prototype.updateHomeKit = function(HomeKitAccessory, deviceData)
             if (deviceData.hvac_state.toUpperCase() == "HEATING") {
                 if (deviceData.previous_hvac_state.toUpperCase() == "COOLING" && deviceData.coolingURL) {
                     // Switched to heating mode and external cooling URL was being used, so stop cooling via cooling URL
-                    __setDaikinAC(deviceData.coolingURL, 0, 3, deviceData.target_temperature_high, 0, "A", 3, this.nestObject.debug);
+                    __setDaikinAC(deviceData.coolingURL, 0, 3, deviceData.target_temperature_high, 0, "A", 3, this.nestObject.config.debug);
                 }
                 if (deviceData.previous_hvac_state.toUpperCase() != "HEATING" && deviceData.heatingURL) {
                     // Switched to heating mode and external heating URL is being used, so start heating via heating URL
@@ -588,7 +625,7 @@ ThermostatClass.prototype.updateHomeKit = function(HomeKitAccessory, deviceData)
                 }
                 if (deviceData.previous_hvac_state.toUpperCase() != "COOLING" && deviceData.coolingURL) {
                     // Switched to cooling mode and external cooling URL is being used, so start cooling via cooling URL
-                    __setDaikinAC(deviceData.coolingURL, 1, 3, this.ThermostatService.getCharacteristic(Characteristic.TargetTemperature).value, 0, "A", 3, this.nestObject.debug);
+                    __setDaikinAC(deviceData.coolingURL, 1, 3, this.ThermostatService.getCharacteristic(Characteristic.TargetTemperature).value, 0, "A", 3, this.nestObject.config.debug);
                 }
                 this.ThermostatService.updateCharacteristic(Characteristic.CurrentHeatingCoolingState, Characteristic.CurrentHeatingCoolingState.COOL);
                 historyEntry.status = 3;    // cooling
@@ -596,7 +633,7 @@ ThermostatClass.prototype.updateHomeKit = function(HomeKitAccessory, deviceData)
             if (deviceData.hvac_state.toUpperCase() == "OFF") {
                 if (deviceData.previous_hvac_state.toUpperCase() == "COOLING" && deviceData.coolingURL) {
                     // Switched to off mode and external cooling URL was being used, so stop cooling via cooling URL
-                    __setDaikinAC(deviceData.coolingURL, 0, 3, deviceData.target_temperature, 0, "A", 3, this.nestObject.debug);
+                    __setDaikinAC(deviceData.coolingURL, 0, 3, deviceData.target_temperature, 0, "A", 3, this.nestObject.config.debug);
                 }
                 if (deviceData.previous_hvac_state.toUpperCase() == "HEATING" && deviceData.heatingURL) {
                     // Switched to off mode and external heating URL was being used, so stop heating via heating URL
@@ -609,11 +646,11 @@ ThermostatClass.prototype.updateHomeKit = function(HomeKitAccessory, deviceData)
             if (this.FanService != null) {
                 if (deviceData.previous_fan_state = false && deviceData.fan_state == true) {
                     // Fan mode was switched on and external fan URL is being used, so start fan via fan URL
-                    deviceData.fanURL && __setDaikinAC(deviceData.fanURL, 1, 6, "--", "--", "A", 3, this.nestObject.debug);
+                    deviceData.fanURL && __setDaikinAC(deviceData.fanURL, 1, 6, "--", "--", "A", 3, this.nestObject.config.debug);
                 }
                 if (deviceData.previous_fan_state == true && deviceData.fan_state == false) {
                     // Fan mode was switched off and external fan URL was being used, so stop fan via fan URL
-                    deviceData.fanURL && __setDaikinAC(deviceData.fanURL, 0, 3, deviceData.target_temperature, 0, "A", 3, this.nestObject.debug);
+                    deviceData.fanURL && __setDaikinAC(deviceData.fanURL, 0, 3, deviceData.target_temperature, 0, "A", 3, this.nestObject.config.debug);
                 }
 
                 this.FanService.updateCharacteristic(Characteristic.On, deviceData.fan_state);   // fan status on or off
@@ -941,8 +978,12 @@ CameraClass.prototype.addDoorbellCamera = function(HomeKitAccessory, thisService
         });
     }
 
-    this.NexusStreamer = new NexusStreamer(this.nestObject.nestCameraToken, this.nestObject.nestTokenType, deviceData, this.nestObject.debug);  // Create streamer object. used for buffering, streaming and recording
+    this.NexusStreamer = new NexusStreamer(this.nestObject.nestCameraToken, this.nestObject.nestTokenType, deviceData, this.nestObject.config.debug);  // Create streamer object. used for buffering, streaming and recording
     this.events = new EventEmitter.EventEmitter();
+
+    // Setup logging. We'll log motion history on the main motion service
+    this.historyService = new HomeKitHistory(HomeKitAccessory, {});
+    this.MotionServices[0] && this.historyService.linkToEveHome(HomeKitAccessory, this.MotionServices[0].service, {});  // Link to Eve Home if we have atleast the main montion service
 
     this.updateHomeKit(HomeKitAccessory, deviceData);  // Do initial HomeKit update
     console.log("Setup %s '%s' on '%s'", HomeKitAccessory.displayName, thisServiceName, HomeKitAccessory.username, deviceData.HKSV == true ? "with HomeKit Secure Video" : this.MotionServices.length >= 1 ? "with motion sensor(s)" : "");
@@ -950,6 +991,12 @@ CameraClass.prototype.addDoorbellCamera = function(HomeKitAccessory, thisService
 
 // Taken and adapted from https://github.com/hjdhjd/homebridge-unifi-protect/blob/eee6a4e379272b659baa6c19986d51f5bf2cbbbc/src/protect-ffmpeg-record.ts
 CameraClass.prototype.handleRecordingStreamRequest = async function *(streamId) {
+    var isLastSegment = false;
+    var header = Buffer.alloc(0);
+    var bufferRemaining = Buffer.alloc(0);
+    var dataLength = 0;
+    var type = "";
+
     // Should only be recording if motion detected
     // Seems sometimes when starting up, HAP-nodeJS or HomeKit triggers this even when motion isn't occuring
     if (this.MotionServices[0].service.getCharacteristic(Characteristic.MotionDetected).value == true) {
@@ -957,15 +1004,15 @@ CameraClass.prototype.handleRecordingStreamRequest = async function *(streamId) 
         var includeAudio = (this.nestObject.nestDevices[this.deviceID].audio_enabled == true && this.controller.recordingManagement.recordingManagementService.getCharacteristic(Characteristic.RecordingAudioActive).value == Characteristic.RecordingAudioActive.ENABLE);
    
         var ffmpeg = "-hide_banner"
-        + " -f h264"
-        + " -i pipe:0"  // Video data on stdin
-        + (includeAudio == true ? " -i pipe:3" : "");  // Audio data on extra pipe created in spawn command
+            + " -f h264"
+            + " -i pipe:0"  // Video data on stdin
+            + (includeAudio == true ? " -i pipe:3" : "");  // Audio data on extra pipe created in spawn command
 
         var ffmpegVideo = " -map 0:v"   // stdin, the first input is video data
-        + " -codec:v copy"    // Appears since we have a H264 stream, shouldn't need to transcode, so just copy the stream
-        + " -force_key_frames expr:gte\(t,n_forced*" + this.HKSVRecordingConfig.videoCodec.parameters.iFrameInterval / 1000 + "\)"
-        + " -fflags +genpts+discardcorrupt"
-        + " -movflags frag_keyframe+empty_moov+default_base_moof";
+            + " -codec:v copy"    // Appears since we have a H264 stream, shouldn't need to transcode, so just copy the stream
+            + " -force_key_frames expr:gte\(t,n_forced*" + this.HKSVRecordingConfig.videoCodec.parameters.iFrameInterval / 1000 + "\)"
+            + " -fflags +genpts+discardcorrupt"
+            + " -movflags frag_keyframe+empty_moov+default_base_moof";
  
         // We have seperate video and audio streams that need to be muxed together if audio recording enabled
         var ffmpegAudio = "";   // No audio yet command yet
@@ -973,27 +1020,21 @@ CameraClass.prototype.handleRecordingStreamRequest = async function *(streamId) 
             var audioSampleRates = ["8", "16", "24", "32", "44.1", "48"];
 
             var ffmpegAudio = " -map 1:a"   // pipe:3, the second input is audio data
-            + " -ar " + audioSampleRates[this.HKSVRecordingConfig.audioCodec.samplerate] + "k"
-            + " -b:a " + this.HKSVRecordingConfig.audioCodec.bitrate + "k"
-            + " -ac " + this.HKSVRecordingConfig.audioCodec.audioChannels
-            + " -bufsize " + (2 * this.HKSVRecordingConfig.audioCodec.bitrate) + "k";
+                + " -ar " + audioSampleRates[this.HKSVRecordingConfig.audioCodec.samplerate] + "k"
+                + " -b:a " + this.HKSVRecordingConfig.audioCodec.bitrate + "k"
+                + " -ac " + this.HKSVRecordingConfig.audioCodec.audioChannels
+                + " -bufsize " + (2 * this.HKSVRecordingConfig.audioCodec.bitrate) + "k";
         }
 
         var ffmpegOutput = " -f mp4"    // output is an mp4
-        + " pipe:1";    // output to stdout
+            + " pipe:1";    // output to stdout
 
         // Build our completed ffmpeg commandline
         var ffmpegCommand = ffmpeg + ffmpegVideo + ffmpegAudio + ffmpegOutput;
 
-        var isLastSegment = false;
-        var header = Buffer.alloc(0);
-        var bufferRemaining = Buffer.alloc(0);
-        var dataLength = 0;
-        var type = "";
-
         this.HKSVRecorder.buffer = [];
         this.HKSVRecorder.ffmpeg = spawn("ffmpeg", ffmpegCommand.split(" "), { env: process.env, stdio: ["pipe", "pipe", "pipe", "pipe"] });    // Extra pipe, #3 for audio data
-        //this.nestObject.debug && console.debug("[HKSV] ffmpeg recording command is %s", ffmpegCommand);
+        //this.nestObject.config.debug && console.debug("[HKSV] ffmpeg recording command is %s", ffmpegCommand);
 
         this.HKSVRecorder.video = this.HKSVRecorder.ffmpeg.stdin;   // Video data on stdio pipe for ffmpeg
         this.HKSVRecorder.audio = (includeAudio == true ? this.HKSVRecorder.ffmpeg.stdio[3] : null);    // Audio data on extra pipe for ffmpeg or null if audio recording disabled
@@ -1052,25 +1093,22 @@ CameraClass.prototype.handleRecordingStreamRequest = async function *(streamId) 
         this.HKSVRecorder.ffmpeg.on("exit", (code, signal) => {
             this.HKSVRecorder.audio && this.HKSVRecorder.audio.end(); // Tidy up our created extra pipe
             if (signal != "SIGKILL") {
-                this.nestObject.debug && console.debug("[HKSV] ffmpeg recorder process exited", code, signal);
+                this.nestObject.config.debug && console.debug("[HKSV] ffmpeg recorder process exited", code, signal);
             }
         });
 
         this.HKSVRecorder.ffmpeg.on("error", (error) => {
-            this.nestObject.debug && console.debug("[HKSV] ffmpeg recorder process error", error);
+            this.nestObject.config.debug && console.debug("[HKSV] ffmpeg recorder process error", error);
         });
 
-        /*
-        // ffmpeg outputs to stderr. We can monitor while testing by un-commenting this section of code
+        // ffmpeg outputs to stderr
         this.HKSVRecorder.ffmpeg.stderr.on("data", (data) => {
-            if (data.toString().includes("frame=") == false) {
-                this.nestObject.debug && console.debug(data.toString());
-            }
+            // Monitor ffmpeg output while testing by un-commenting this section of code
+            //this.nestObject.config.debug && console.debug(data.toString());
         });
-        */
 
         this.NexusStreamer.startRecordStream("HKSV" + streamId, this.HKSVRecorder.ffmpeg, this.HKSVRecorder.video, this.HKSVRecorder.audio);
-        this.nestObject.debug && console.debug("[HKSV] Started recording %s on '%s'. Stream ID is '%s'", (includeAudio == true ? "with audio" : "without audio"), this.deviceID, streamId);
+        this.nestObject.config.debug && console.debug("[HKSV] Started recording %s on '%s'. Stream ID is '%s'", (includeAudio == true ? "with audio" : "without audio"), this.nestObject.nestDevices[this.deviceID].mac_address, streamId);
 
         try {
             for await (const mp4box of this.segmentGenerator()) {
@@ -1091,12 +1129,12 @@ CameraClass.prototype.handleRecordingStreamRequest = async function *(streamId) 
         } catch (error) {
             console.log("handleRecordingStreamRequest", error);
         }
+    }
 
-        if (isLastSegment == false && this.HKSVRecorder.ffmpeg != null) {
-            // Seems we have haven't sent last segment notification to HKSV (likely some failure?), so do so now. Will still generate a HDS error in log
-            yield { data: Buffer.alloc(0), isLast: true };
-            return;
-        }
+    if (isLastSegment == false) {
+        // Seems we have haven't sent last segment notification to HKSV (likely some failure?), so do so now. Will still generate a HDS error in log
+        yield { data: Buffer.alloc(0), isLast: true };
+        return;
     }
 }
 
@@ -1132,19 +1170,12 @@ CameraClass.prototype.segmentGenerator = async function *() {
 }
 
 CameraClass.prototype.closeRecordingStream = function(streamId, reason) {
-    var motionDetected = this.MotionServices[0].service.getCharacteristic(Characteristic.MotionDetected).value;
-    if (motionDetected == true) {
-        this.nestObject.debug && console.debug("[HKSV] Motioned ended from closed stream");
-        this.MotionServices[0].service.updateCharacteristic(Characteristic.MotionDetected, false);
-        clearTimeout(this.motionTimer); // Clear any motion running timer
-        this.motionTimer = null;   // No motion timer active
-    }
     this.NexusStreamer.stopRecordStream("HKSV" + streamId); // Stop the associated recording stream
     this.events.emit(MP4BOX);
     this.events.removeAllListeners(MP4BOX, this.segmentGenerator);  // Tidy up
     this.HKSVRecorder.ffmpeg && this.HKSVRecorder.ffmpeg.kill("SIGKILL"); // Kill the ffmpeg recorder process
     this.HKSVRecorder = {ffmpeg: null, buffer: null, video: null, audio: null};
-    this.nestObject.debug && console.debug("[HKSV] Finished recording on '%s'. Stream ID was '%s'", this.deviceID, streamId, reason);
+    this.nestObject.config.debug && console.debug("[HKSV] Finished recording on '%s'. Stream ID was '%s'", this.nestObject.nestDevices[this.deviceID].mac_address, streamId, reason);
 }
 
 CameraClass.prototype.acknowledgeStream = function(streamId) {
@@ -1158,12 +1189,12 @@ CameraClass.prototype.updateRecordingActive = function(active) {
         // Start a buffering stream for this camera/doorbell. Ensures motion captures all video on motion trigger
         // Required due to data delays by on prem Nest to cloud to HomeKit accessory to iCloud etc
         // Make sure have appropriate bandwidth!!!
-        this.nestObject.debug && console.debug("[HKSV] Started buffering for '%s", this.deviceID);
+        this.nestObject.config.debug && console.debug("[HKSV] Started buffering for '%s'", this.nestObject.nestDevices[this.deviceID].mac_address);
         this.NexusStreamer.startBuffering(this.nestObject.nestDevices[this.deviceID].HKSVPreBuffer);
     }
     if (active == false && this.HKSVDoRecordings != active) {
         this.NexusStreamer.stopBuffering();
-        this.nestObject.debug && console.debug("[HKSV] Stopped buffering for '%s", this.deviceID);
+        this.nestObject.config.debug && console.debug("[HKSV] Stopped buffering for '%s'", this.nestObject.nestDevices[this.deviceID].mac_address);
     }
     this.HKSVDoRecordings = active;
 }
@@ -1188,7 +1219,7 @@ CameraClass.prototype.handleSnapshotRequest = async function(request, callback) 
                     }
                 })
                 .catch(error => {
-                    this.nestObject.debug && console.debug("[NEST] Failed to get event snapshot image. Error", error.message, error.config.url);
+                    this.nestObject.config.debug && console.debug("[NEST] Failed to get event snapshot image. Error", error.message, error.config.url);
                 });
             } else {
                     // Get current image from the doorbell/camera feed
@@ -1200,7 +1231,7 @@ CameraClass.prototype.handleSnapshotRequest = async function(request, callback) 
                     }
                 })
                 .catch(error => {
-                    this.debug && console.debug("[NEST] Failed to get current snapshot image. Error", error.message, error.config.url);
+                    this.config.debug && console.debug("[NEST] Failed to get current snapshot image. Error", error.message, error.config.url);
                 });
             }
         }
@@ -1246,7 +1277,7 @@ CameraClass.prototype.prepareStream = async function(request, callback) {
         audioSSRC: CameraController.generateSynchronisationSource(),
 
         rtpSplitter: null,
-        ffmpeg: [], // Array of ffmpeg process we create for streaming video and audio talkback
+        ffmpeg: [], // Array of ffmpeg process we create for streaming video/audio and audio talkback
         video: null,
         audio: null
     };
@@ -1341,15 +1372,15 @@ CameraClass.prototype.handleStreamRequest = async function (request, callback) {
             ffmpegStreaming.stderr.on("data", (data) => {
                 // We'll check for any output data that includes "frame", so we know ffmpeg is producing video output. 
                 // If ffmpeg is slow to start frames, produces "slow to respond" error from HAP-NodeJS
-                if (typeof callback == "function") { //} && data.toString().includes("frame=") == true) {
+                if (typeof callback == "function") {  //&& data.toString().includes("frame=") == true) {
                     callback();  // Notify HomeKit we've started video stream
                     callback = null;    // Signal we've done the callback by clearing it
-                }
+                };
             });
 
             ffmpegStreaming.on("exit", (code, signal) => {
                 if (signal != "SIGKILL" || signal == null) {
-                    this.nestObject.debug && console.debug("[NEST] Video stream stopped", code, signal);
+                    this.nestObject.config.debug && console.debug("[NEST] Video stream stopped", code, signal);
                     if (typeof callback == "function") callback(new Error("Video Stream stopped"));
                     callback = null;    // Signal we've done the callback by clearing it
                     this.controller.forceStopStreamingSession(request.sessionID);
@@ -1372,7 +1403,7 @@ CameraClass.prototype.handleStreamRequest = async function (request, callback) {
             
                 ffmpegAudioReturn = spawn("ffmpeg", ffmpegCommand.split(" "), { env: process.env });
                 ffmpegAudioReturn.on("error", (error) => {
-                    this.nestObject.debug && console.debug("[NEST] Failed to start Nest camera audio stream (speaker)", error.message);
+                    this.nestObject.config.debug && console.debug("[NEST] Failed to start Nest camera audio stream (speaker)", error.message);
                     if (typeof callback == "function") callback(new Error("ffmpeg process creation failed!"));
                     callback = null;    // Signal we've done the callback by clearing it
                 });
@@ -1398,7 +1429,7 @@ CameraClass.prototype.handleStreamRequest = async function (request, callback) {
             this.ongoingSessions[request.sessionID].audio = request.audio;  // Cache the audio request details
 
             // Finally start the stream from nexus
-            this.nestObject.debug && console.debug("[NEST] Started live stream on '%s'", this.deviceID);
+            this.nestObject.config.debug && console.debug("[NEST] Started live stream on '%s'", this.nestObject.nestDevices[this.deviceID].mac_address);
             this.NexusStreamer.startLiveStream("HK" + request.sessionID, ffmpegStreaming.stdin, (includeAudio == true ? ffmpegStreaming.stdio[3] : null), (this.twoWayAudio == true ? ffmpegAudioReturn.stdout : null));
             break;
         }
@@ -1414,14 +1445,14 @@ CameraClass.prototype.handleStreamRequest = async function (request, callback) {
                 this.controller.forceStopStreamingSession(request.sessionID);
                 delete this.ongoingSessions[request.sessionID]; // this session has finished
             }
-            this.nestObject.debug && console.debug("[NEST] Stopped live stream on '%s'", this.deviceID);
+            this.nestObject.config.debug && console.debug("[NEST] Stopped live stream on '%s'", this.nestObject.nestDevices[this.deviceID].mac_address);
             callback();
             break;
         }
 
         case "reconfigure" : {
             // todo - implement???
-            this.nestObject.debug && console.debug("[NEST] Reconfiguration request for live stream on '%s'", this.deviceID);
+            this.nestObject.config.debug && console.debug("[NEST] Reconfiguration request for live stream on '%s'", this.nestObject.nestDevices[this.deviceID].mac_address);
             callback();
             break;
         }
@@ -1436,6 +1467,14 @@ CameraClass.prototype.updateHomeKit = function(HomeKitAccessory, deviceData) {
         if (deviceData.HKSV == true) {
             // Update camera off/on status for HKSV from Nest
             this.controller.recordingManagement.operatingModeService.updateCharacteristic(Characteristic.ManuallyDisabled, (deviceData.streaming_enabled == true ? Characteristic.ManuallyDisabled.ENABLED : Characteristic.ManuallyDisabled.DISABLED));
+
+            // TODO: If bugs fixed in HAPNodeJS and/or HomeKit for HSKV:
+            // set CharacteristicCameraOperatingModeIndicator
+            // 
+            //if (deviceData.capabilities.includes("irled") == true) {
+            //    // Set nightvision status in HomeKit
+            //    this.controller.recordingManagement.operatingModeService.updateCharacteristic(Characteristic.NightVision, (deviceData.properties["irled.state"].toUpperCase() == "OFF" ? false : true));
+            //}
         }
 
         // Update any camera details if we have a Nexus streamer object created
@@ -1481,14 +1520,14 @@ CameraClass.prototype.updateHomeKit = function(HomeKitAccessory, deviceData) {
             // We'll always process a doorbell press event regardless of Characteristic.HomeKitCameraActive state in HKSV
             if (typeof this.controller.doorbellService == "object" && event.types.includes("doorbell") == true) {
                 if (this.doorbellTimer == null) {
-                    this.nestObject.debug && console.debug("[NEST] Doorbell pressed on '%s'", this.deviceID);
+                    this.nestObject.config.debug && console.debug("[NEST] Doorbell pressed on '%s'", this.deviceID);
                     
                     // Cooldown for doorbell button being pressed (filters out constant pressing for time period)
                     // Start this before we process further
                     this.doorbellTimer = setTimeout(function () {
                         this.snapshotEvent = {type: "", time: 0, id: 0, done: false}; // Clear snapshot event image after timeout
                         this.doorbellTimer = null;  // No doorbell timer active
-                    }.bind(this), DOORBELLCOOLDOWN);
+                    }.bind(this), deviceData.doorbellCooldown);
 
                     if (event.types.includes("motion") == false) {
                         // No motion event with the doorbell alert, so add one to support any HKSV recording
@@ -1500,60 +1539,68 @@ CameraClass.prototype.updateHomeKit = function(HomeKitAccessory, deviceData) {
                 }
             }
 
-            // Handle motion event only for HKSV enabled camera. We will use this to trigger the starting of the HKSV recording
-            // Motion is only activated if configured via Characteristic.HomeKitCameraActive == 1 (on)
-            if (deviceData.HKSV == true && event.types.includes("motion") == true) {   
-                if (this.controller.recordingManagement.operatingModeService.getCharacteristic(Characteristic.HomeKitCameraActive).value == Characteristic.HomeKitCameraActive.ON) {
-                    if (this.MotionServices[0].service.getCharacteristic(Characteristic.MotionDetected).value != true) {
-                        // Make sure if motion detected, the motion sensor is still active
-                        this.nestObject.debug && console.debug("[NEST] Motion started on '%s'", this.deviceID);
-                        this.MotionServices[0].service.updateCharacteristic(Characteristic.MotionDetected, true);    // Trigger motion
-                    }
+            if (this.MotionServices.length >= 1) {
+                // We have at least one motion sensor service, so allows us to proceed here
 
-                    clearTimeout(this.motionTimer); // Clear any motion active timer so we can extend
-                    this.motionTimer = setTimeout(function () {
-                        this.nestObject.debug && console.debug("[NEST] Motion ended on '%s'", this.deviceID);
-                        this.MotionServices[0].service.updateCharacteristic(Characteristic.MotionDetected, false);  // clear motion
-                        this.motionTimer = null;   // No motion timer active
-                    }.bind(this), MOTIONCOOLDOWN);
-                }
-            }
-
-            // Handle person/face event for non HKSV enabled cameras and only those marked as important
-            // We also treat a "face" event the same as a person event ie: if have a face, you have a person
-            if (deviceData.HKSV == false && (event.types.includes("person") == true || event.types.includes("face") == true)) {
-                if (event.is_important == true && this.doorbellTimer == null && this.personTimer == null) {
-                    this.nestObject.debug && console.debug("[NEST] Person detected on '%s'", this.deviceID);
-
-                    // Cooldown for person being detected
-                    // Start this before we process further
-                    this.personTimer = setTimeout(function () {
-                        this.snapshotEvent = {type: "", time: 0, id: 0, done: false}; // Clear snapshot event image after timeout
-                        this.MotionServices.forEach((motionService, index) => { 
-                            motionService.service.updateCharacteristic(Characteristic.MotionDetected, false);  // clear any motion
-                        });
-                        this.personTimer = null;  // No person timer active
-                    }.bind(this), PERSONCOOLDOWN);
-
-                    // Check which zone triggered the person alert and update associated motion sensor(s)
-                    this.snapshotEvent = {type: "person", time: event.playback_time, id : event.id, done: false};
-                    event.zone_ids.forEach(zoneID => {
-                        var index = this.MotionServices.findIndex( ({ id }) => id == zoneID);
-                        if (index != -1) {
-                            this.MotionServices[index].service.updateCharacteristic(Characteristic.MotionDetected, true);    // Trigger motion for matching zone
+                // Handle motion event only for HKSV enabled camera. We will use this to trigger the starting of the HKSV recording
+                // Motion is only activated if configured via Characteristic.HomeKitCameraActive == 1 (on)
+                if (deviceData.HKSV == true && event.types.includes("motion") == true) {   
+                    if (this.controller.recordingManagement.operatingModeService.getCharacteristic(Characteristic.HomeKitCameraActive).value == Characteristic.HomeKitCameraActive.ON) {
+                        if (this.MotionServices[0].service.getCharacteristic(Characteristic.MotionDetected).value != true) {
+                            // Make sure if motion detected, the motion sensor is still active
+                            this.nestObject.config.debug && console.debug("[NEST] Motion started on '%s'", this.nestObject.nestDevices[this.deviceID].mac_address);
+                            this.MotionServices[0].service.updateCharacteristic(Characteristic.MotionDetected, true);    // Trigger motion
+                            this.historyService.addHistory(this.MotionServices[0].service, {time: Math.floor(new Date() / 1000), status: 1});   // Motion started for history
                         }
-                    });
+
+                        clearTimeout(this.motionTimer); // Clear any motion active timer so we can extend
+                        this.motionTimer = setTimeout(function () {
+                            this.nestObject.config.debug && console.debug("[NEST] Motion ended on '%s'", this.nestObject.nestDevices[this.deviceID].mac_address);
+                            this.MotionServices[0].service.updateCharacteristic(Characteristic.MotionDetected, false);  // clear motion
+                            this.historyService.addHistory(this.MotionServices[0].service, {time: Math.floor(new Date() / 1000), status: 0});   // Motion ended for history
+                            this.motionTimer = null;   // No motion timer active
+                        }.bind(this), deviceData.motionCooldown);
+                    }
+                }
+
+                // Handle person/face event for non HKSV enabled cameras and only those marked as important
+                // We also treat a "face" event the same as a person event ie: if have a face, you have a person
+                if (deviceData.HKSV == false && (event.types.includes("person") == true || event.types.includes("face") == true)) {
+                    if (event.is_important == true && this.doorbellTimer == null && this.personTimer == null) {
+                        this.nestObject.config.debug && console.debug("[NEST] Person detected on '%s'", this.nestObject.nestDevices[this.deviceID].mac_address);
+
+                        // Cooldown for person being detected
+                        // Start this before we process further
+                        this.personTimer = setTimeout(function () {
+                            this.snapshotEvent = {type: "", time: 0, id: 0, done: false}; // Clear snapshot event image after timeout
+                            this.historyService.addHistory(this.MotionServices[0].service, {time: Math.floor(new Date() / 1000), status: 0});   // Motion ended for history
+                            this.MotionServices.forEach((motionService, index) => { 
+                                motionService.service.updateCharacteristic(Characteristic.MotionDetected, false);  // clear any motion
+                            });
+                            this.personTimer = null;  // No person timer active
+                        }.bind(this), deviceData.personCooldown);
+
+                        // Check which zone triggered the person alert and update associated motion sensor(s)
+                        this.historyService.addHistory(this.MotionServices[0].service, {time: Math.floor(new Date() / 1000), status: 1});   // Motion started for history
+                        this.snapshotEvent = {type: "person", time: event.playback_time, id : event.id, done: false};
+                        event.zone_ids.forEach(zoneID => {
+                            var index = this.MotionServices.findIndex( ({ id }) => id == zoneID);
+                            if (index != -1) {
+                                this.MotionServices[index].service.updateCharacteristic(Characteristic.MotionDetected, true);    // Trigger motion for matching zone
+                            }
+                        });
+                    }
+                }
+
+                // Handle motion event for non HKSV enabled cameras
+                // TODO
+                if (deviceData.HKSV == false && event.types.includes("motion") == true) { 
                 }
             }
 
             // Handle package event for non HKSV enabled cameras
             // TODO
             if (deviceData.HKSV == false && event.types.includes("package") == true) {
-            }
-
-            // Handle motion event for non HKSV enabled cameras
-            // TODO
-            if (deviceData.HKSV == false && event.types.includes("motion") == true) { 
             }
             
             // Handle sound event for non HKSV enabled cameras
@@ -1571,11 +1618,11 @@ NestClass.prototype.nestConnect = async function() {
     var tempToken = ""; 
     this.tokenExpire = null;    // Get below
     this.nestToken = "";    // Clear token
-    if (this.refreshToken != "") {
+    if (this.config.refreshToken != "") {
         // Google refresh token method. 
         // Use login.js taken from homebridge_nest or homebridge_nest_cam to obtain
-        this.debug && console.debug("[NEST] Performing Google account authorisation");
-        await axios.post("https://oauth2.googleapis.com/token", "refresh_token=" + this.refreshToken + "&client_id=733249279899-1gpkq9duqmdp55a7e5lft1pr2smumdla.apps.googleusercontent.com&grant_type=refresh_token", {headers: {"Content-Type": "application/x-www-form-urlencoded", "user-agent": USERAGENT}})
+        this.config.debug && console.debug("[NEST] Performing Google account authorisation");
+        await axios.post("https://oauth2.googleapis.com/token", "refresh_token=" + this.config.refreshToken + "&client_id=733249279899-1gpkq9duqmdp55a7e5lft1pr2smumdla.apps.googleusercontent.com&grant_type=refresh_token", {headers: {"Content-Type": "application/x-www-form-urlencoded", "user-agent": USERAGENT}})
         .then(async (response) => {
             if (response.status == 200) {
                 await axios.post("https://nestauthproxyservice-pa.googleapis.com/v1/issue_jwt", "embed_google_oauth_access_token=true&expire_after=3600s&google_oauth_access_token=" + response.data.access_token + "&policy_id=authproxy-oauth-policy", {headers: {"referer": REFERER,"user-agent": USERAGENT, "Authorization": "Bearer " + response.data.access_token} })
@@ -1595,13 +1642,13 @@ NestClass.prototype.nestConnect = async function() {
         });
     }
 
-    if (this.sessionToken != "") {
+    if (this.config.sessionToken != "") {
         // Nest session token method. Get WEBSITE2 cookie for use with camera API calls if needed later
-        this.debug && console.debug("[NEST] Performing Nest account authorisation");
-        await axios.post(CAMERAAPIHOST + "/api/v1/login.login_nest", Buffer.from("access_token=" + this.sessionToken, "utf8"), {withCredentials: true, headers: {"referer": "https://home.nest.com", "Content-Type": "application/x-www-form-urlencoded", "user-agent": USERAGENT} })
+        this.config.debug && console.debug("[NEST] Performing Nest account authorisation");
+        await axios.post(CAMERAAPIHOST + "/api/v1/login.login_nest", Buffer.from("access_token=" + this.config.sessionToken, "utf8"), {withCredentials: true, headers: {"referer": "https://home.nest.com", "Content-Type": "application/x-www-form-urlencoded", "user-agent": USERAGENT} })
         .then((response) => {
             if (response.status == 200 && response.data && response.data.status == 0) {
-                tempToken = this.sessionToken; // Since we got camera details, this is a good token to use
+                tempToken = this.config.sessionToken; // Since we got camera details, this is a good token to use
                 this.nestCameraToken = response.data.items[0].session_token; // We'll put this in API header calls for cameras
                 this.nestTokenType = "nest";  // Nest account
                 this.cameraAPI.key = "cookie";  // We'll put this in API header calls for cameras
@@ -1629,16 +1676,16 @@ NestClass.prototype.nestConnect = async function() {
                 // Set timeout for token expiry refresh
                 clearInterval(this.tokenTimer)
                 this.tokenTimer = setTimeout(async function() {
-                    this.debug && console.debug("[NEST] Performing token expiry refresh");
+                    this.config.debug && console.debug("[NEST] Performing token expiry refresh");
                     this.nestConnect();
                 }.bind(this), (this.tokenExpire - Math.floor(Date.now() / 1000) - 60) * 1000); // Refresh just before token expiry
-                this.debug && console.debug("[NEST] Successfully authorised to Nest");
+                this.config.debug && console.debug("[NEST] Successfully authorised to Nest");
             }
         })
         .catch(error => {
         });
     } else {
-        this.debug && console.debug("[NEST] Authorisation to Nest failed");
+        this.config.debug && console.debug("[NEST] Authorisation to Nest failed");
     }
     return tempToken;
 }
@@ -1657,7 +1704,7 @@ NestClass.prototype.getNestData = async function() {
                     this.rawNestData.quartz[deviceID].nexus_api_nest_domain_host = camera.nexus_api_http_server_url.replace(/dropcam.com/ig, "camera.home.nest.com");  // avoid extra API call to get this detail by simple domain name replace
 
                     // Only get doorbell/camera activity zone details if HKSV isn't enabled
-                    if (this.HomeKitSecureVideo == false || (this.extraOptions[this.rawNestData.quartz[deviceID].serial_number.toUpperCase()] && this.extraOptions[this.rawNestData.quartz[deviceID].serial_number.toUpperCase()].HKSV == false)) {
+                    if (this.HKSV == false || (this.extraOptions[this.rawNestData.quartz[deviceID].serial_number.toUpperCase()] && this.extraOptions[this.rawNestData.quartz[deviceID].serial_number.toUpperCase()].HKSV == false)) {
                         await axios.get(this.rawNestData.quartz[deviceID].nexus_api_nest_domain_host + "/cuepoint_category/" + deviceID, {headers: {"user-agent": USERAGENT, [this.cameraAPI.key] : this.cameraAPI.value + this.nestCameraToken}, responseType: "json", timeout: NESTAPITIMEOUT})
                         .then(async (response)=> {
                             if (response.status && response.status == 200) {
@@ -1683,11 +1730,11 @@ NestClass.prototype.getNestData = async function() {
                 }));
             }
             else {
-                this.debug && console.debug("[NEST] Failed to get Nest data. HTTP status returned", response.status);
+                this.config.debug && console.debug("[NEST] Failed to get Nest data. HTTP status returned", response.status);
             }
         })
         .catch(error => {
-            this.debug && console.debug("[NEST] Nest data get failed with error", error.message);
+            this.config.debug && console.debug("[NEST] Nest data get failed with error", error.message);
         });
     }
 }
@@ -1698,12 +1745,12 @@ NestClass.prototype.setNestStructure = async function(nestStructure, key, value,
         await axios.post(this.nestURL + "/v2/put/" + nestStructure, JSON.stringify( { "target_change_pending": targetChange, [key]: value}), {headers: {"content-type": "application/json", "user-agent": USERAGENT, "Authorization": "Basic " + this.nestToken} })
         .then(response => {
             if (response.status == 200) {
-                this.debug && console.debug("[NEST] Successfully set Nest structure element of '%s' to '%s' on '%s", key, value, nestStructure);
+                this.config.debug && console.debug("[NEST] Successfully set Nest structure element of '%s' to '%s' on '%s", key, value, nestStructure);
                 retValue = true;    // successfully set Nest structure value
             }
         })
         .catch(error => {
-            this.debug && console.debug("[NEST] Failed to set Nest structure element with error", error.message);
+            this.config.debug && console.debug("[NEST] Failed to set Nest structure element with error", error.message);
         });
     }
     return retValue;
@@ -1715,12 +1762,12 @@ NestClass.prototype.setNestCamera = async function(deviceID, key, value) {
         await axios.post(CAMERAAPIHOST + "/api/dropcams.set_properties", [key] + "=" + value + "&uuid=" + this.nestDevices[deviceID].camera_uuid, {headers: {"content-type": "application/x-www-form-urlencoded", "user-agent": USERAGENT, "Referer" : REFERER, [this.cameraAPI.key] : this.cameraAPI.value + this.nestCameraToken}, responseType: "json", timeout: NESTAPITIMEOUT})
         .then((response) => {
             if (response.status == 200 && response.data.status == 0) {
-                this.debug && console.debug("[NEST] Successfully set Nest Camera element of '%s' to '%s' on '%s", key, value, deviceID);
+                this.config.debug && console.debug("[NEST] Successfully set Nest Camera element of '%s' to '%s' on '%s", key, value, deviceID);
                 retValue = true;    // successfully set Nest camera value
             }
         })
         .catch(error => {
-            this.debug && console.debug("[NEST] Failed to set Nest Camera element with error", error.message);
+            this.config.debug && console.debug("[NEST] Failed to set Nest Camera element with error", error.message);
         });
     }
     return retValue;
@@ -1730,7 +1777,7 @@ NestClass.prototype.deviceSubscribe = function(deviceID, HomeKitAccessory, callb
     if (deviceID != null) {
         if (action == "add") {
             if (typeof this.deviceEvents[deviceID] != "object") {
-                this.debug && console.debug("[NEST] Setup subscription for devices changes on '%s", HomeKitAccessory.username);
+                this.config.debug && console.debug("[NEST] Setup subscription for devices changes on '%s'", HomeKitAccessory.username);
 
                 this.deviceEvents[deviceID] = {};
                 this.deviceEvents[deviceID].nestID = this.nestDevices[deviceID].nest_device_structure;
@@ -1742,12 +1789,12 @@ NestClass.prototype.deviceSubscribe = function(deviceID, HomeKitAccessory, callb
                     // since this device is also a doorbell/camera, startup the additional polling loop for activity zones and alerts changes
                     // This is done per doorbell/camera
                     // required for HKSV and non-HKSV enabled camera
-                    this.debug && console.debug("[NEST] Setup polling loop for doorbell/camera alerts on '%s'", HomeKitAccessory.username);
+                    this.config.debug && console.debug("[NEST] Setup polling loop for doorbell/camera alerts on '%s'", HomeKitAccessory.username);
                     this.__nestCameraPolling(deviceID, "alerts");   // for alerts
 
                     if (this.nestDevices[deviceID].HKSV == false) {
                         // for activity zone changes - only required for non-HKSV enabled camera
-                        this.debug && console.debug("[NEST] Setup polling loop for doorbell/camera activity zone changes on '%s'", HomeKitAccessory.username);
+                        this.config.debug && console.debug("[NEST] Setup polling loop for doorbell/camera activity zone changes on '%s'", HomeKitAccessory.username);
                         this.__nestCameraPolling(deviceID, "zones");    // for zones
                     }
                 }
@@ -1756,7 +1803,7 @@ NestClass.prototype.deviceSubscribe = function(deviceID, HomeKitAccessory, callb
 
         if (action == "remove") {
             if (typeof this.deviceEvents[deviceID] == "object") {
-                this.debug && console.debug("[NEST] Removed subscription for devices changes on '%s", HomeKitAccessory.username);
+                this.config.debug && console.debug("[NEST] Removed subscription for devices changes on '%s", HomeKitAccessory.username);
 
                 this.removeAllListeners(deviceID, this.deviceEvents[deviceID].callback);    // Remove lister for device updates
                 delete this.deviceEvents[deviceID];
@@ -1944,8 +1991,10 @@ NestClass.prototype.__processNestData = function(nestData) {
                 });
 
                 // Get associated schedules
-                // TODO
-                //nestData.schedule[thermostat.serial_number].
+                this.nestDevices[thermostat.serial_number].schedules = {};
+                if (typeof nestData.schedule[thermostat.serial_number] == "object") {
+                    this.nestDevices[thermostat.serial_number].schedules = nestData.schedule[thermostat.serial_number].days;
+                }
 
                 // Insert any extra options we've read in from configuration file
                 this.extraOptions[thermostat.serial_number] && Object.entries(this.extraOptions[thermostat.serial_number]).forEach(([key, value]) => {
@@ -2104,8 +2153,11 @@ NestClass.prototype.__processNestData = function(nestData) {
                 this.nestDevices[camera.serial_number].structureID = camera.structure_id; // structure ID
 
                 // Insert any extra options we've read in from configuration file for this device
-                this.nestDevices[camera.serial_number].HKSV = this.HomeKitSecureVideo;    // By default, we use the global config option for HomeKit Secure Video. Can override for specific doorbell/camera
-                this.nestDevices[camera.serial_number].HKSVPreBuffer = this.HomeKitSecureVideoBufSize;  // By default, we use the global config option for HKSV pre buffering size. Can override for specific doorbell/camera
+                this.nestDevices[camera.serial_number].HKSV = this.config.HKSV;    // Global config option for HomeKit Secure Video. Gets overriden below for specific doorbell/camera
+                this.nestDevices[camera.serial_number].HKSVPreBuffer = this.config.HKSVPreBuffer;  // Global config option for HKSV pre buffering size. Gets overriden below for specific doorbell/camera
+                this.nestDevices[camera.serial_number].doorbellCooldown = this.config.doorbellCooldown; // Global default for doorbell press cooldown. Gets overriden below for specific doorbell/camera
+                this.nestDevices[camera.serial_number].motionCooldown = this.config.motionCooldown; // Global default for motion detected cooldown. Gets overriden below for specific doorbell/camera
+                this.nestDevices[camera.serial_number].personCooldown = this.config.personCooldown; // Global default for person detected cooldown. Gets overriden below for specific doorbell/camera
                 this.extraOptions[camera.serial_number] && Object.entries(this.extraOptions[camera.serial_number]).forEach(([key, value]) => {
                     this.nestDevices[camera.serial_number][key] = value;
                 });
@@ -2146,7 +2198,7 @@ NestClass.prototype.__nestCameraPolling = function(deviceID, action) {
             }
         })
         .catch(error => {
-            this.debug && console.debug("[NEST] Error getting alerts for '%s'", deviceID, error.message)
+            this.config.debug && console.debug("[NEST] Error getting alerts for '%s'", this.nestDevices[deviceID].mac_address, error.message)
         })
         .finally(() => {
             // Poll again for alerts after configured delay. We'll test here if the deviceID is still in our Nest data before calling again
@@ -2181,7 +2233,7 @@ NestClass.prototype.__nestCameraPolling = function(deviceID, action) {
             }
         })
         .catch(error => {
-            this.debug && console.debug("[NEST] Error getting zone details for '%s'", deviceID, error.message);
+            this.config.debug && console.debug("[NEST] Error getting zone details for '%s'", this.nestDevices[deviceID].mac_address, error.message);
         })
         .finally(() => {
             // Poll for activity zone changes again after configured delay. We'll test here if the deviceID is still in our Nest data before calling again
@@ -2321,7 +2373,7 @@ NestClass.prototype.__nestSubscribe = async function() {
             });
         }
         else {
-            this.debug && console.debug("[NEST] Nest subscription failed. HTTP status returned", response.status);
+            this.config.debug && console.debug("[NEST] Nest subscription failed. HTTP status returned", response.status);
         }
     })
     .catch((error) => {
@@ -2329,19 +2381,19 @@ NestClass.prototype.__nestSubscribe = async function() {
             if (error.response && error.response.status == 404) {
                 // URL not found
                 subscribeAgainTimeout = 5000;   // Since bad URL, try again after 5 seconds
-                this.debug && console.debug("[NEST] Nest subscription failed. URL not found");
+                this.config.debug && console.debug("[NEST] Nest subscription failed. URL not found");
             } else if (error.response && error.response.status == 400) {
                 // bad subscribe
                 subscribeAgainTimeout = 5000;   // Since bad subscribe, try again after 5 seconds
-                this.debug && console.debug("[NEST] Nest subscription failed. Bad subscription data");
+                this.config.debug && console.debug("[NEST] Nest subscription failed. Bad subscription data");
             } else if (error.response && error.response.status == 502) {
                 // gateway error
                 subscribeAgainTimeout = 10000;  // Since bad gateway error, try again after 10 seconds
-                this.debug && console.debug("[NEST] Nest subscription failed. Bad gateway");
+                this.config.debug && console.debug("[NEST] Nest subscription failed. Bad gateway");
             } else {
                 // Other unknown error  
                 subscribeAgainTimeout = 5000;   // Try again afer 5 seconds
-                this.debug && console.debug("[NEST] Nest subscription failed with error", error.message);
+                this.config.debug && console.debug("[NEST] Nest subscription failed with error", error.message);
             }
         }
     })
