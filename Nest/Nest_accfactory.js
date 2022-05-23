@@ -117,6 +117,16 @@ var HomeKitHistory = require("./HomeKitHistory");
 var NexusStreamer = require("./nexusstreamer");
 var DoorbellController = require("../").DoorbellController;
 var CameraController = require("../").CameraController;
+var SRTPCryptoSuites = require("../").SRTPCryptoSuites;
+var HDSProtocolSpecificErrorReason = require("../").HDSProtocolSpecificErrorReason;
+var H264Profile = require("../").H264Profile;
+var H264Level = require("../").H264Level;
+var AudioStreamingCodecType = require("../").AudioStreamingCodecType;
+var AudioStreamingSamplerate = require("../").AudioStreamingSamplerate;
+var AudioRecordingCodecType = require("../").AudioRecordingCodecType;
+var AudioRecordingSamplerate = require("../"). AudioRecordingSamplerate;
+var VideoCodecType = require("../").VideoCodecType;
+var MediaContainerType = require("../").MediaContainerType;
 var dgram = require("dgram");
 var net = require("net");
 var ip = require("ip");
@@ -290,7 +300,12 @@ function CameraClass() {
     this.controller = null;                     // HomeKit Camera/Doorbell controller service
     this.MotionServices = [];                   // Status of Nest Hello/Cam(s) motion sensor(s)
     this.updatingHomeKit = false;               // Flag if were doing an HomeKit update or not
-    this.snapshotEvent = {type: "", time: 0, id: 0, "done": false};
+    this.snapshotEvent = {
+        type: "",
+        time: 0, 
+        id: 0, 
+        "done": false
+    };
     this.pendingSessions = [];                      
     this.ongoingSessions = [];
     this.cachedSnapshot = null;                 // Cached camera snapshot from stream
@@ -303,9 +318,14 @@ function CameraClass() {
     this.historyService = null;                 // History logging service
 
     // HKSV stuff
-    this.HKSVDoRecordings = null;               // Tracks updateRecordingActive. default is unknown state, but HomeKit will select
     this.HKSVRecordingConfig = {};              // HomeKit Secure Video recording configuration
-    this.HKSVRecorder = {ffmpeg: null, buffer: null, video: null, audio: null};
+    this.HKSVRecorder = {
+        record: null,                           // Tracks updateRecordingActive. default is unknown state, but HomeKit will select
+        ffmpeg: null,                           // ffmpeg process for recording
+        buffer: null,                           // buffer of processed recording
+        video: null,                            // video input stream
+        audio: null                             // audio input stream
+    };
 }
 
 
@@ -826,7 +846,7 @@ CameraClass.prototype.addDoorbellCamera = function(HomeKitAccessory, thisService
         cameraStreamCount: 2, // HomeKit requires at least 2 streams, but 1 is also just fine
         delegate: this, // Our class is the delgate for handling streaming/images
         streamingOptions: {
-            supportedCryptoSuites: [0], // SRTPCryptoSuites.AES_CM_128_HMAC_SHA1_80
+            supportedCryptoSuites: [SRTPCryptoSuites.AES_CM_128_HMAC_SHA1_80],
             video: {
                 resolutions: [
                     [1920, 1080, 30],   // width, height, framerate
@@ -843,16 +863,16 @@ CameraClass.prototype.addDoorbellCamera = function(HomeKitAccessory, thisService
                     [320, 180, 30],
                 ],
                 codec: {
-                    profiles : [0, 1, 2], // H264Profile.HIGH = 0x02, as default profile in streamer is VIDEO_H264_2MBIT_L40
-                    levels: [0, 1, 2], // H264Level.LEVEL4_0 = 0x02, as Default level in streamer is VIDEO_H264_2MBIT_L40
+                    profiles : [H264Profile.HIGH, H264Profile.MAIN, H264Profile.BASELINE], // Use H264Profile.HIGH as default profile in streamer is VIDEO_H264_2MBIT_L40
+                    levels: [H264Level.LEVEL3_1, H264Level.LEVEL3_2, H264Level.LEVEL4_0], // use H264Level.LEVEL4_0 as Default level in streamer is VIDEO_H264_2MBIT_L40
                 },
             },
             audio : {
                 twoWayAudio: (deviceData.capabilities.includes("audio.speaker") && deviceData.capabilities.includes("audio.microphone")) ? true : false,    // If both speaker & microphone capabilities, then we support twoway audio
                 codecs: [
                     {
-                        type: "AAC-eld", // AudioStreamingCodecType.AAC_ELD
-                        samplerate: 16, // AudioStreamingSamplerate.KHZ_16
+                        type: AudioStreamingCodecType.AAC_ELD,
+                        samplerate: AudioStreamingSamplerate.KHZ_16
                     },
                 ], 
             },
@@ -886,15 +906,15 @@ CameraClass.prototype.addDoorbellCamera = function(HomeKitAccessory, thisService
                 audio : {
                     codecs: [
                         {
-                            type: 1, // AudioRecordingCodecType.AAC_ELD
-                            samplerate: 1, // AudioRecordingSamplerate.KHZ_16
+                            type: AudioRecordingCodecType.AAC_ELD,
+                            samplerate: AudioRecordingSamplerate.KHZ_16
                         },
                     ], 
                 },
                 mediaContainerConfiguration: [
                     {
                         fragmentLength: 4000,
-                        type: 0x00  // FRAGMENTED_MP4
+                        type: MediaContainerType.FRAGMENTED_MP4
                     }
                 ],
 
@@ -915,10 +935,10 @@ CameraClass.prototype.addDoorbellCamera = function(HomeKitAccessory, thisService
                         [320, 180, 30],
                     ],
                     parameters: {
-                        profiles : [0, 1, 2], // H264Profile.HIGH = 0x02, as default profile in streamer is VIDEO_H264_2MBIT_L40
-                        levels: [0, 1, 2], // H264Level.LEVEL4_0 = 0x02, as Default level in streamer is VIDEO_H264_2MBIT_L40
+                        profiles : [H264Profile.HIGH, H264Profile.MAIN, H264Profile.BASELINE], // Use H264Profile.HIGH as default profile in streamer is VIDEO_H264_2MBIT_L40
+                        levels: [H264Level.LEVEL3_1, H264Level.LEVEL3_2, H264Level.LEVEL4_0], // use H264Level.LEVEL4_0 as Default level in streamer is VIDEO_H264_2MBIT_L40
                     },
-                    type: 0x00  // VideoCodecType.H264
+                    type: VideoCodecType.H264
                 }
             }
         };
@@ -1108,7 +1128,7 @@ CameraClass.prototype.handleRecordingStreamRequest = async function *(streamId) 
         });
 
         this.NexusStreamer.startRecordStream("HKSV" + streamId, this.HKSVRecorder.ffmpeg, this.HKSVRecorder.video, this.HKSVRecorder.audio);
-        this.nestObject.config.debug && console.debug("[HKSV] Started recording %s on '%s'. Stream ID is '%s'", (includeAudio == true ? "with audio" : "without audio"), this.nestObject.nestDevices[this.deviceID].mac_address, streamId);
+        this.nestObject.config.debug && console.debug("[HKSV] Recording started on '%s' %s", this.nestObject.nestDevices[this.deviceID].mac_address, (includeAudio == true ? "with audio" : "without audio"));
 
         try {
             for await (const mp4box of this.segmentGenerator()) {
@@ -1174,29 +1194,39 @@ CameraClass.prototype.closeRecordingStream = function(streamId, reason) {
     this.events.emit(MP4BOX);
     this.events.removeAllListeners(MP4BOX, this.segmentGenerator);  // Tidy up
     this.HKSVRecorder.ffmpeg && this.HKSVRecorder.ffmpeg.kill("SIGKILL"); // Kill the ffmpeg recorder process
-    this.HKSVRecorder = {ffmpeg: null, buffer: null, video: null, audio: null};
-    this.nestObject.config.debug && console.debug("[HKSV] Finished recording on '%s'. Stream ID was '%s'", this.nestObject.nestDevices[this.deviceID].mac_address, streamId, reason);
+    this.HKSVRecorder.ffmpeg = null; 
+    this.HKSVRecorder.buffer = null; 
+    this.HKSVRecorder.video = null;
+    this.HKSVRecorder.audio = null;
+    if (this.nestObject.config.debug == true) {
+        // Log recording finished messages depending on reason
+        if (reason == HDSProtocolSpecificErrorReason.NORMAL) {
+            console.debug("[HKSV] Recording completed on '%s'", this.nestObject.nestDevices[this.deviceID].mac_address);
+        } else {
+            console.debug("[HKSV] Recording completed with error on '%s'. Reason was '%s'", this.nestObject.nestDevices[this.deviceID].mac_address, HDSProtocolSpecificErrorReason[reason]);
+        }
+    }
 }
 
 CameraClass.prototype.acknowledgeStream = function(streamId) {
-    this.closeRecordingStream(streamId, 0);  // HDSProtocolSpecificErrorReason.NORMAL
+    this.closeRecordingStream(streamId, HDSProtocolSpecificErrorReason.NORMAL);
 }
 
 CameraClass.prototype.updateRecordingActive = function(active) {
     // We'll use the change here to determine if we start/stop any buffering.
     // Also track the HomeKit status here as gets called multiple times with no change
-    if (active == true && this.HKSVDoRecordings != active && this.nestObject.nestDevices[this.deviceID].HKSVPreBuffer > 0) {
+    if (active == true && this.HKSVRecorder.record != active && this.nestObject.nestDevices[this.deviceID].HKSVPreBuffer > 0) {
         // Start a buffering stream for this camera/doorbell. Ensures motion captures all video on motion trigger
         // Required due to data delays by on prem Nest to cloud to HomeKit accessory to iCloud etc
         // Make sure have appropriate bandwidth!!!
-        this.nestObject.config.debug && console.debug("[HKSV] Started buffering for '%s'", this.nestObject.nestDevices[this.deviceID].mac_address);
+        this.nestObject.config.debug && console.debug("[HKSV] Pre-buffering started for '%s'", this.nestObject.nestDevices[this.deviceID].mac_address);
         this.NexusStreamer.startBuffering(this.nestObject.nestDevices[this.deviceID].HKSVPreBuffer);
     }
-    if (active == false && this.HKSVDoRecordings != active) {
+    if (active == false && this.HKSVRecorder.record != active) {
         this.NexusStreamer.stopBuffering();
-        this.nestObject.config.debug && console.debug("[HKSV] Stopped buffering for '%s'", this.nestObject.nestDevices[this.deviceID].mac_address);
+        this.nestObject.config.debug && console.debug("[HKSV] Pre-buffering stopped for '%s'", this.nestObject.nestDevices[this.deviceID].mac_address);
     }
-    this.HKSVDoRecordings = active;
+    this.HKSVRecorder.record = active;
 }
 
 CameraClass.prototype.updateRecordingConfiguration = function(configuration) {
@@ -1231,7 +1261,7 @@ CameraClass.prototype.handleSnapshotRequest = async function(request, callback) 
                     }
                 })
                 .catch(error => {
-                    this.config.debug && console.debug("[NEST] Failed to get current snapshot image. Error", error.message, error.config.url);
+                    this.nestObject.config.debug && console.debug("[NEST] Failed to get current snapshot image. Error", error.message, error.config.url);
                 });
             }
         }
@@ -1429,7 +1459,7 @@ CameraClass.prototype.handleStreamRequest = async function (request, callback) {
             this.ongoingSessions[request.sessionID].audio = request.audio;  // Cache the audio request details
 
             // Finally start the stream from nexus
-            this.nestObject.config.debug && console.debug("[NEST] Started live stream on '%s'", this.nestObject.nestDevices[this.deviceID].mac_address);
+            this.nestObject.config.debug && console.debug("[NEST] Live stream started on '%s'", this.nestObject.nestDevices[this.deviceID].mac_address);
             this.NexusStreamer.startLiveStream("HK" + request.sessionID, ffmpegStreaming.stdin, (includeAudio == true ? ffmpegStreaming.stdio[3] : null), (this.twoWayAudio == true ? ffmpegAudioReturn.stdout : null));
             break;
         }
@@ -1445,14 +1475,14 @@ CameraClass.prototype.handleStreamRequest = async function (request, callback) {
                 this.controller.forceStopStreamingSession(request.sessionID);
                 delete this.ongoingSessions[request.sessionID]; // this session has finished
             }
-            this.nestObject.config.debug && console.debug("[NEST] Stopped live stream on '%s'", this.nestObject.nestDevices[this.deviceID].mac_address);
+            this.nestObject.config.debug && console.debug("[NEST] Live stream stopped on '%s'", this.nestObject.nestDevices[this.deviceID].mac_address);
             callback();
             break;
         }
 
         case "reconfigure" : {
             // todo - implement???
-            this.nestObject.config.debug && console.debug("[NEST] Reconfiguration request for live stream on '%s'", this.nestObject.nestDevices[this.deviceID].mac_address);
+            this.nestObject.config.debug && console.debug("[NEST] Reconfiguration request for live stream on '%s'. Not supported at present.", this.nestObject.nestDevices[this.deviceID].mac_address);
             callback();
             break;
         }
