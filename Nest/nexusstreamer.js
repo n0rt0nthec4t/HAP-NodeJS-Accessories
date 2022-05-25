@@ -5,7 +5,7 @@
 // Cleaned up/recoded
 //
 // Mark Hulskamp
-// 21/5/2022
+// 24/5/2022
 //
 // done
 // -- switching camera stream on/off - going from off to on doesn't restart stream from Nest
@@ -16,6 +16,7 @@
 // -- support both Nest and Google accounts
 // -- Modification to sending buffer before recording starts. Should result in cleaner ffmpeg process output and more reliable HKSV recordings
 // -- further fixes for restarting streams
+// -- fixed switching camera off/offline image frames to streams
 // 
 // todo
 // -- When camera goes offline, we don't get notified straight away and video stream stops. Perhaps timer to go to camera off image if no data receieve in past 15 seconds?
@@ -23,20 +24,23 @@
 //    **Think know what this issue is. When outputting a new stream, need to align to H264 SPS frame
 // -- get snapshot image for current stream if active
 // -- audio echo with return audio
-// -- fix switching camera off/offline image frames to streams. Broken atm
 // -- speed up live image stream starting when have a buffer active. Should almost start straight away
 
 "use strict";
 
+// Define external lbrary requirements
 var protoBuf = require("pbf");  // Proto buffer
-var fs = require("fs");
 var WebSocket = require("ws");
-var {spawnSync} = require("child_process");
+
+// Define nodejs module requirements
+var fs = require("fs");
 
 // Define constants
 const USERAGENT = "iPhone iOS 15.4 Dropcam/5.67.0.6 com.nestlabs.jasper.release Darwin";
-const PINGINTERVAL = 15000;         // 15 seconds between each ping to nexus server while stream active
-const TIMERINTERVAL = 1000;         // 1 second
+const PINGINTERVAL = 15000;                                 // 15 seconds between each ping to nexus server while stream active
+const TIMERINTERVAL = 1000;                                 // 1 second
+const CAMERAOFFLINEH264FILE = "Nest_camera_offline.h264";   // Camera offline H264 frame file
+const CAMERAOFFH264FILE = "Nest_camera_off.h264";           // Camera off H264 frame file
 
 const CodecType = {
     SPEEX : 0,
@@ -46,7 +50,7 @@ const CodecType = {
     OPUS : 4,
     META : 5,
     DIRECTORS_CUT : 6,
-}
+};
 
 const StreamProfile = {
     AUDIO_AAC : 3,
@@ -64,7 +68,7 @@ const StreamProfile = {
     VIDEO_H264_L40 : 15,
     AVPROFILE_MOBILE_1 : 1,
     AVPROFILE_HD_MAIN_1 : 2,
-}
+};
 
 const ErrorCode = {
     ERROR_CAMERA_NOT_CONNECTED : 1,
@@ -73,15 +77,15 @@ const ErrorCode = {
     ERROR_NO_TRANSCODER_AVAILABLE : 4,
     ERROR_TRANSCODE_PROXY_ERROR : 5,
     ERROR_INTERNAL : 6,
-}
+};
 
 const Reason = {
     ERROR_TIME_NOT_AVAILABLE : 1,
     ERROR_PROFILE_NOT_AVAILABLE : 2,
     ERROR_TRANSCODE_NOT_AVAILABLE : 3,
-    ERROR_UKNOWN1 : 4,
+    ERROR_UKNOWN1 : 4,  // Redirect???
     PLAY_END_SESSION_COMPLETE : 128,
-}
+};
 
 const PacketType = {
     PING : 1,
@@ -107,21 +111,21 @@ const PacketType = {
     METADATA : 210,
     METADATA_ERROR : 211,
     AUTHORIZE_REQUEST : 212,
-}
+};
 
 const ProtocolVersion = {
     VERSION_1 : 1,
     VERSION_2 : 2,
     VERSION_3 : 3
-}
+};
 
 const ClientType = {
     ANDROID : 1,
     IOS : 2,
     WEB : 3
-}
+};
 
-const H264FrameTyes = {
+const H264FrameTypes = {
     STAP_A : 24,
     FU_A : 28,
     NON_IDR : 1,
@@ -130,7 +134,59 @@ const H264FrameTyes = {
     SPS : 7,
     PPS : 8,
     DELIMITER : 9
-}
+};
+
+const H264NALUnit = [0x00, 0x00, 0x00, 0x01];
+
+// Blank audio in AAC format, mono channel @48000kbs
+const AACMONO48000BLANK = [
+    0xFF, 0xF1, 0x4C, 0x40, 0x03, 0x9F, 0xFC, 0xDE, 0x02, 0x00, 0x4C, 0x61,
+	0x76, 0x63, 0x35, 0x39, 0x2E, 0x31, 0x38, 0x2E, 0x31, 0x30, 0x30, 0x00,
+	0x02, 0x30, 0x40, 0x0E, 0xFF, 0xF1, 0x4C, 0x40, 0x01, 0x7F, 0xFC, 0x01,
+	0x18, 0x20, 0x07, 0xFF, 0xF1, 0x4C, 0x40, 0x01, 0x7F, 0xFC, 0x01, 0x18,
+	0x20, 0x07, 0xFF, 0xF1, 0x4C, 0x40, 0x01, 0x7F, 0xFC, 0x01, 0x18, 0x20,
+	0x07, 0xFF, 0xF1, 0x4C, 0x40, 0x01, 0x7F, 0xFC, 0x01, 0x18, 0x20, 0x07,
+	0xFF, 0xF1, 0x4C, 0x40, 0x01, 0x7F, 0xFC, 0x01, 0x18, 0x20, 0x07, 0xFF,
+	0xF1, 0x4C, 0x40, 0x01, 0x7F, 0xFC, 0x01, 0x18, 0x20, 0x07, 0xFF, 0xF1,
+	0x4C, 0x40, 0x01, 0x7F, 0xFC, 0x01, 0x18, 0x20, 0x07, 0xFF, 0xF1, 0x4C,
+	0x40, 0x01, 0x7F, 0xFC, 0x01, 0x18, 0x20, 0x07, 0xFF, 0xF1, 0x4C, 0x40,
+	0x01, 0x7F, 0xFC, 0x01, 0x18, 0x20, 0x07, 0xFF, 0xF1, 0x4C, 0x40, 0x01,
+	0x7F, 0xFC, 0x01, 0x18, 0x20, 0x07, 0xFF, 0xF1, 0x4C, 0x40, 0x01, 0x7F,
+	0xFC, 0x01, 0x18, 0x20, 0x07, 0xFF, 0xF1, 0x4C, 0x40, 0x01, 0x7F, 0xFC,
+	0x01, 0x18, 0x20, 0x07, 0xFF, 0xF1, 0x4C, 0x40, 0x01, 0x7F, 0xFC, 0x01,
+	0x18, 0x20, 0x07, 0xFF, 0xF1, 0x4C, 0x40, 0x01, 0x7F, 0xFC, 0x01, 0x18,
+	0x20, 0x07, 0xFF, 0xF1, 0x4C, 0x40, 0x01, 0x7F, 0xFC, 0x01, 0x18, 0x20,
+	0x07, 0xFF, 0xF1, 0x4C, 0x40, 0x01, 0x7F, 0xFC, 0x01, 0x18, 0x20, 0x07,
+	0xFF, 0xF1, 0x4C, 0x40, 0x01, 0x7F, 0xFC, 0x01, 0x18, 0x20, 0x07, 0xFF,
+	0xF1, 0x4C, 0x40, 0x01, 0x7F, 0xFC, 0x01, 0x18, 0x20, 0x07, 0xFF, 0xF1,
+	0x4C, 0x40, 0x01, 0x7F, 0xFC, 0x01, 0x18, 0x20, 0x07, 0xFF, 0xF1, 0x4C,
+	0x40, 0x01, 0x7F, 0xFC, 0x01, 0x18, 0x20, 0x07, 0xFF, 0xF1, 0x4C, 0x40,
+	0x01, 0x7F, 0xFC, 0x01, 0x18, 0x20, 0x07, 0xFF, 0xF1, 0x4C, 0x40, 0x01,
+	0x7F, 0xFC, 0x01, 0x18, 0x20, 0x07, 0xFF, 0xF1, 0x4C, 0x40, 0x01, 0x7F,
+	0xFC, 0x01, 0x18, 0x20, 0x07, 0xFF, 0xF1, 0x4C, 0x40, 0x01, 0x7F, 0xFC,
+	0x01, 0x18, 0x20, 0x07, 0xFF, 0xF1, 0x4C, 0x40, 0x01, 0x7F, 0xFC, 0x01,
+	0x18, 0x20, 0x07, 0xFF, 0xF1, 0x4C, 0x40, 0x01, 0x7F, 0xFC, 0x01, 0x18,
+	0x20, 0x07, 0xFF, 0xF1, 0x4C, 0x40, 0x01, 0x7F, 0xFC, 0x01, 0x18, 0x20,
+	0x07, 0xFF, 0xF1, 0x4C, 0x40, 0x01, 0x7F, 0xFC, 0x01, 0x18, 0x20, 0x07,
+	0xFF, 0xF1, 0x4C, 0x40, 0x01, 0x7F, 0xFC, 0x01, 0x18, 0x20, 0x07, 0xFF,
+	0xF1, 0x4C, 0x40, 0x01, 0x7F, 0xFC, 0x01, 0x18, 0x20, 0x07, 0xFF, 0xF1,
+	0x4C, 0x40, 0x01, 0x7F, 0xFC, 0x01, 0x18, 0x20, 0x07, 0xFF, 0xF1, 0x4C,
+	0x40, 0x01, 0x7F, 0xFC, 0x01, 0x18, 0x20, 0x07, 0xFF, 0xF1, 0x4C, 0x40,
+	0x01, 0x7F, 0xFC, 0x01, 0x18, 0x20, 0x07, 0xFF, 0xF1, 0x4C, 0x40, 0x01,
+	0x7F, 0xFC, 0x01, 0x18, 0x20, 0x07, 0xFF, 0xF1, 0x4C, 0x40, 0x01, 0x7F,
+	0xFC, 0x01, 0x18, 0x20, 0x07, 0xFF, 0xF1, 0x4C, 0x40, 0x01, 0x7F, 0xFC,
+	0x01, 0x18, 0x20, 0x07, 0xFF, 0xF1, 0x4C, 0x40, 0x01, 0x7F, 0xFC, 0x01,
+	0x18, 0x20, 0x07, 0xFF, 0xF1, 0x4C, 0x40, 0x01, 0x7F, 0xFC, 0x01, 0x18,
+	0x20, 0x07, 0xFF, 0xF1, 0x4C, 0x40, 0x01, 0x7F, 0xFC, 0x01, 0x18, 0x20,
+	0x07, 0xFF, 0xF1, 0x4C, 0x40, 0x01, 0x7F, 0xFC, 0x01, 0x18, 0x20, 0x07,
+	0xFF, 0xF1, 0x4C, 0x40, 0x01, 0x7F, 0xFC, 0x01, 0x18, 0x20, 0x07, 0xFF,
+	0xF1, 0x4C, 0x40, 0x01, 0x7F, 0xFC, 0x01, 0x18, 0x20, 0x07, 0xFF, 0xF1,
+	0x4C, 0x40, 0x01, 0x7F, 0xFC, 0x01, 0x18, 0x20, 0x07, 0xFF, 0xF1, 0x4C,
+	0x40, 0x01, 0x7F, 0xFC, 0x01, 0x18, 0x20, 0x07, 0xFF, 0xF1, 0x4C, 0x40,
+	0x01, 0x7F, 0xFC, 0x01, 0x18, 0x20, 0x07, 0xFF, 0xF1, 0x4C, 0x40, 0x01,
+	0x7F, 0xFC, 0x01, 0x18, 0x20, 0x07, 0xFF, 0xF1, 0x4C, 0x40, 0x01, 0x7F,
+	0xFC, 0x01, 0x18, 0x20, 0x07
+];
 
 // NeuxsStreamer object
 class NexusStreamer {
@@ -161,14 +217,22 @@ class NexusStreamer {
 
         // buffer for camera offline image in .h264 frame
         this.camera_offline_h264_frame = null;
-        if (fs.existsSync(__dirname + "/Nest_camera_offline.h264")) {
-            this.camera_offline_h264_frame = fs.readFileSync(__dirname + "/Nest_camera_offline.h264");
+        if (fs.existsSync(__dirname + "/" + CAMERAOFFLINEH264FILE)) {
+            this.camera_offline_h264_frame = fs.readFileSync(__dirname + "/" + CAMERAOFFLINEH264FILE);
+            // remove any H264 NALU from being of any video data
+            if (this.camera_offline_h264_frame.length >= 3 && this.camera_offline_h264_frame[0] == 0x00 && this.camera_offline_h264_frame[1] == 0x00 && this.camera_offline_h264_frame[2] == 0x00 && this.camera_offline_h264_frame[3] == 0x01) {
+                this.camera_offline_h264_frame = this.camera_offline_h264_frame.slice(4);
+            }
         }
 
         // buffer for camera stream off image in .h264 frame
         this.camera_off_h264_frame = null;
-        if (fs.existsSync(__dirname + "/Nest_camera_off.h264")) {
-            this.camera_off_h264_frame = fs.readFileSync(__dirname + "/Nest_camera_off.h264");
+        if (fs.existsSync(__dirname + "/" + CAMERAOFFH264FILE)) {
+            this.camera_off_h264_frame = fs.readFileSync(__dirname + "/" + CAMERAOFFH264FILE);
+            // remove any H264 NALU from being of any video data
+            if (this.camera_off_h264_frame.length >= 3 && this.camera_off_h264_frame[0] == 0x00 && this.camera_off_h264_frame[1] == 0x00 && this.camera_off_h264_frame[2] == 0x00 && this.camera_off_h264_frame[3] == 0x01) {
+                this.camera_off_h264_frame = this.camera_off_h264_frame.slice(4);
+            }
         }
 
         this.debug && console.debug("[NEXUS] Streamer created for '%s'", this.host);
@@ -266,6 +330,7 @@ NexusStreamer.prototype.stopRecordStream = function(sessionID) {
     // If we have no more streams active, we'll close the socket to nexus
     if (this.ffmpeg.length == 0) {
         // Don't have any other streams going, so can close the active socket connection
+        clearInterval(this.timer);
         this.__close(true);
 
         this.sessionID = null;
@@ -286,6 +351,7 @@ NexusStreamer.prototype.stopLiveStream = function(sessionID) {
     // If we have no more streams active, we'll close the socket to nexus
     if (this.ffmpeg.length == 0) {
         // Don't have any other streams going, so can close the active socket connection
+        clearInterval(this.timer);
         this.__close(true);
 
         this.sessionID = null;
@@ -305,6 +371,7 @@ NexusStreamer.prototype.stopBuffering = function() {
     // If we have no more streams active, we'll close the socket to nexus
     if (this.ffmpeg.length == 0) {
         // Don't have any other streams going, so can close the active socket connection
+        clearInterval(this.timer);
         this.__close(true); 
 
         this.sessionID = null;
@@ -377,13 +444,15 @@ NexusStreamer.prototype.__connect = function(host) {
 
         this.socket.on("close", () => {
             clearInterval(this.pingtimer);    // Clear ping timer
-            this.debug && console.debug("[NEXUS] Socket closed to '%s'", this.host);
             if (this.socket != null && this.socket.readyState == WebSocket.CLOSED && this.ffmpeg.length >= 1) {
                 // Since we still have ffmpeg streams registered, would indicate we didnt close the socket
                 // so re-connect and start processing data again
                 // update host to connected to??
-                this.__connect();
+                this.debug && console.debug("[NEXUS] Socket closet on '%s'. Will attempt re-connect to '%s'", this.host, this.camera.websocket_nexustalk_host);
+                this.__connect(this.camera.websocket_nexustalk_host);
                 this.__startNexusData();
+            } else {
+                this.debug && console.debug("[NEXUS] Socket closed to '%s'", this.host);
             }
         });
     }
@@ -394,12 +463,14 @@ NexusStreamer.prototype.__connect = function(host) {
         if (this.camera.online == false) {
             // Camera is offline, so feed in our custom h264 frame for playback
             this.__ffmpegRouter("video", this.camera_offline_h264_frame);
+            this.__ffmpegRouter("audio", Buffer.from(AACMONO48000BLANK));
         }
         if (this.camera.streaming_enabled == false && this.camera.online == true) {
             // Camera video is turned off so feed in our custom h264 frame for playback
             this.__ffmpegRouter("video", this.camera_off_h264_frame);
+            this.__ffmpegRouter("audio", Buffer.from(AACMONO48000BLANK));
         }
-    }, TIMERINTERVAL);
+    }, (TIMERINTERVAL / 30));   // output at 30 fps?
 }
 
 NexusStreamer.prototype.__close = function(sendStop) {
@@ -411,7 +482,7 @@ NexusStreamer.prototype.__close = function(sendStop) {
             stopBuffer.writeVarintField(1, this.sessionID); // session ID}
             this.__sendMessage(PacketType.STOP_PLAYBACK, stopBuffer.finish());
         }
-        if (this.socket.readyState != WebSocket.CLOSED) {
+        if (this.socket.readyState == WebSocket.OPEN) {
             // Socket not closed, so close it
             this.socket.close();
         }
@@ -424,7 +495,6 @@ NexusStreamer.prototype.__startNexusData = function() {
     if (this.camera.streaming_enabled == true && this.camera.online == true) {
         // Attempt to use camera's stream profile or use default
         var otherProfiles = [];
-        this.camera.audio_enabled == true && otherProfiles.push(StreamProfile.AUDIO_AAC); // Include AAC if audio enabled on camera
         this.camera.capabilities.forEach((element) => {
             if (element.startsWith("streaming.cameraprofile")) {
                 var profile = element.replace("streaming.cameraprofile.", "");
@@ -434,6 +504,8 @@ NexusStreamer.prototype.__startNexusData = function() {
                 }
             }
         });
+
+        if (this.camera.audio_enabled == true) otherProfiles.push(StreamProfile.AUDIO_AAC); // Include AAC if audio enabled on camera
 
         var startBuffer = new protoBuf();
         startBuffer.writeVarintField(1, this.sessionID);   // Session ID
@@ -453,6 +525,8 @@ NexusStreamer.prototype.__stopNexusData = function() {
 
 NexusStreamer.prototype.__ffmpegRouter = function(type, data) {
     // Send out our nexus data to any streams we're managing, including performing any buffering as required
+
+    // Add the data to any buffer(s) we have
     var bufferIndex = this.ffmpeg.findIndex(({ type }) => type == "buffer");
     if (bufferIndex != -1) {
         // We have a buffering stream active, so add data to its buffer first
@@ -468,11 +542,11 @@ NexusStreamer.prototype.__ffmpegRouter = function(type, data) {
         if (ffmpeg.type == "live") {
             // Align to h264 SPS frame before we send any data on. Should allow cleaner ffmpeg processing
             // Does make starting live stream in HomeKit slightly slower
-            if (type == "video" && (data[0] & 0x1f) == H264FrameTyes.SPS) ffmpeg.aligned = true;
+            if (type == "video" && (data[0] & 0x1f) == H264FrameTypes.SPS) ffmpeg.aligned = true;
             if (ffmpeg.aligned == true) {
                 if (type == "video" && ffmpeg.video != null) {
                     // H264 NAL Units "0001" are required to be added to beginning of any video data we output
-                    ffmpeg.video.write(Buffer.concat([Buffer.from([0x00, 0x00, 0x00, 0x01]), data]));
+                    ffmpeg.video.write(Buffer.concat([Buffer.from(H264NALUnit), data]));
                 }
                 if (type == "audio" && ffmpeg.audio != null) { 
                     ffmpeg.audio.write(data);
@@ -487,13 +561,13 @@ NexusStreamer.prototype.__ffmpegRouter = function(type, data) {
 
                 for (var bufferData = this.ffmpeg[bufferIndex].buffer.shift(); bufferData; bufferData = this.ffmpeg[bufferIndex].buffer.shift()) {
                     // Align to h264 SPS frame before we send any data on. Should allow cleaner ffmpeg processing
-                    if (bufferData.type == "video" && (bufferData.data[0] & 0x1f) == H264FrameTyes.SPS) ffmpeg.aligned = true;
+                    if (bufferData.type == "video" && (bufferData.data[0] & 0x1f) == H264FrameTypes.SPS) ffmpeg.aligned = true;
                     if (ffmpeg.aligned == true) {
                         // Should be aligned to buffer h264 frame video sequence of SPS, PPS and IDR frames as receieved from nexus stream
                         // Send anything in buffer from this position
                         if (bufferData.type == "video" && ffmpeg.video != null) {
                             // H264 NAL Units "0001" are required to be added to beginning of any video data
-                            ffmpeg.video.write(Buffer.concat([Buffer.from([0x00, 0x00, 0x00, 0x01]), bufferData.data]));
+                            ffmpeg.video.write(Buffer.concat([Buffer.from(H264NALUnit), bufferData.data]));
                         }
                         if (bufferData.type == "audio" && ffmpeg.audio != null) {
                             ffmpeg.audio.write(bufferData.data);
@@ -504,7 +578,7 @@ NexusStreamer.prototype.__ffmpegRouter = function(type, data) {
                 // Since didnt need to empty buffer first, send on any new data
                 if (type == "video" && ffmpeg.video != null) {
                     // H264 NAL Units "0001" are required to be added to beginning of any video data we output
-                    ffmpeg.video.write(Buffer.concat([Buffer.from([0x00, 0x00, 0x00, 0x01]), data]));
+                    ffmpeg.video.write(Buffer.concat([Buffer.from(H264NALUnit), data]));
                 }
                 if (type == "audio" && ffmpeg.audio != null) { 
                     ffmpeg.audio.write(data);
@@ -717,9 +791,7 @@ NexusStreamer.prototype.__handlePlaybackEnd = function(payload) {
 
         default : {
             // Another kind of error.
-            this.debug && console.debug("[NEXUS] Playback ended on with error '%s'. We'll attempt to restart", this.host, packet.reason);
-            //this.__connect(this.camera.websocket_nexustalk_host);   // Re-connect
-            //this.__startNexusData();    // Restart processing Nexus data
+            this.debug && console.debug("[NEXUS] Playback ended on with error '%s'", this.host, packet.reason);
             break;
         }
     }
