@@ -17,18 +17,26 @@
 // -- Eve Room2 history returns
 // -- internally check if specified minimun time between entries and if so, ignore logging it
 // -- small correction to number formatting when retreving history for EveHome
+// -- Storage access fix when using HAP-NodeJS as a library (removes dependancy on node-persist modules for this module)
 //
-// Version 13/10/2021
+// Version 23/5/2022
 // Mark Hulskamp
 
-const MAX_HISTORY_SIZE = 16384; // 16k entries
+// Define HAP-NodeJS requirements
+var HAPNodeJS = require("hap-nodejs");
+var Service = HAPNodeJS.Service;
+var Characteristic = HAPNodeJS.Characteristic;
+var HAPStorage = HAPNodeJS.HAPStorage;
 
-var Service = require("../").Service;
-var Characteristic = require("../").Characteristic;
+// Define nodejs module requirements
 var util = require("util");
 var fs = require("fs");
-var storage = require("node-persist");
 
+// Define constants
+const MAX_HISTORY_SIZE = 16384; // 16k entries
+
+
+// Create the history object
 class HomeKitHistory {
 	constructor(HomeKitAccessory, optionalParams) {
 
@@ -44,8 +52,9 @@ class HomeKitHistory {
         // Setup HomeKitHistory storage using HAP-NodeJS persist location
         // can be overridden by passing in location optional parameter
         this.storageKey = util.format("History.%s.json", HomeKitAccessory.username.replace(/:/g, "").toUpperCase());
-        if (this.location != "" && typeof this.location == "string") storage.init({dir: this.location});
-		this.historyData = storage.getItem(this.storageKey);
+
+        this.storage = HAPStorage.storage();  // Load storage from HAP-NodeJS. We'll use it's persist folder for storing history files
+		this.historyData = this.storage.getItem(this.storageKey);
 		if (typeof this.historyData != "object") {
             // Getting storage key didnt return an object, we'll assume no history present, so start new history for this accessory
             this.resetHistory();    // Start with blank history
@@ -238,7 +247,7 @@ HomeKitHistory.prototype.resetHistory = function() {
     this.historyData.next = 0;      // next entry for history is at start
     this.historyData.types = [];    // no service types in history
     this.historyData.data = [];     // no history data
-    storage.setItem(this.storageKey, this.historyData);
+    this.storage.setItem(this.storageKey, this.historyData);
 }
 
 HomeKitHistory.prototype.rolloverHistory = function() {
@@ -249,7 +258,7 @@ HomeKitHistory.prototype.rolloverHistory = function() {
     this.historyData.rollover = Math.floor(new Date() / 1000);
     this.historyData.next = 0;
     this.__updateHistoryTypes();
-    storage.setItem(this.storageKey, this.historyData);
+    this.storage.setItem(this.storageKey, this.historyData);
 }
 
 HomeKitHistory.prototype.__addEntry = function(type, sub, time, timegap, entry) {
@@ -299,7 +308,7 @@ HomeKitHistory.prototype.__addEntry = function(type, sub, time, timegap, entry) 
             }
         });
 
-        storage.setItem(this.storageKey, this.historyData); // Save to persistent storage
+        this.storage.setItem(this.storageKey, this.historyData); // Save to persistent storage
     }
 }
 
