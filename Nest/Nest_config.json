@@ -2,5 +2,6 @@
     "SessionToken" : "<nest session token here or blank>",
     "RefreshToken" : "<google refresh token here or blank>",
     "Debug" : false,
-    "HKSV" : true
+    "HKSV" : true,
+    "H264Encoder" : "libx264"
 }
