@@ -1098,7 +1098,7 @@ CameraClass.prototype.handleRecordingStreamRequest = async function *(streamId) 
             + (recordCodec == VideoCodecs.LIBX264 ? " -level:v " + ((this.HKSVRecordingConfig.videoCodec.parameters.level == H264Level.LEVEL4_0) ? "4.0" : (this.HKSVRecordingConfig.videoCodec.parameters.level == H264Level.LEVEL3_2) ? "3.2" : "3.1") : "")
             + (recordCodec == VideoCodecs.LIBX264 ? " -preset veryfast" : "")
             + " -b:v " + this.HKSVRecordingConfig.videoCodec.parameters.bitRate + "k"
-            + " -filter:v fps=fps=" + this.HKSVRecordingConfig.videoCodec.resolution[2]; // convert to framerate HomeKit has requested
+            + " -filter:v fps=" + this.HKSVRecordingConfig.videoCodec.resolution[2]; // convert to framerate HomeKit has requested
         }
 
         var ffmpegVideo = ffmpegVideo 
