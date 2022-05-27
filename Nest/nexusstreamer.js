@@ -25,6 +25,7 @@
 // -- get snapshot image for current stream if active
 // -- audio echo with return audio
 // -- speed up live image stream starting when have a buffer active. Should almost start straight away
+// -- dynamic audio switching on/off from camera
 
 "use strict";
 
@@ -136,10 +137,10 @@ const H264FrameTypes = {
     DELIMITER : 9
 };
 
-const H264NALUnit = [0x00, 0x00, 0x00, 0x01];
+const H264NALUnit = Buffer.from([0x00, 0x00, 0x00, 0x01]);
 
-// Blank audio in AAC format, mono channel @48000kbs
-const AACMONO48000BLANK = [
+// Blank audio in AAC format, mono channel @48000
+const AACMONO48000BLANK = Buffer.from([
     0xFF, 0xF1, 0x4C, 0x40, 0x03, 0x9F, 0xFC, 0xDE, 0x02, 0x00, 0x4C, 0x61,
 	0x76, 0x63, 0x35, 0x39, 0x2E, 0x31, 0x38, 0x2E, 0x31, 0x30, 0x30, 0x00,
 	0x02, 0x30, 0x40, 0x0E, 0xFF, 0xF1, 0x4C, 0x40, 0x01, 0x7F, 0xFC, 0x01,
@@ -186,7 +187,7 @@ const AACMONO48000BLANK = [
 	0x01, 0x7F, 0xFC, 0x01, 0x18, 0x20, 0x07, 0xFF, 0xF1, 0x4C, 0x40, 0x01,
 	0x7F, 0xFC, 0x01, 0x18, 0x20, 0x07, 0xFF, 0xF1, 0x4C, 0x40, 0x01, 0x7F,
 	0xFC, 0x01, 0x18, 0x20, 0x07
-];
+]);
 
 // NeuxsStreamer object
 class NexusStreamer {
@@ -219,9 +220,9 @@ class NexusStreamer {
         this.camera_offline_h264_frame = null;
         if (fs.existsSync(__dirname + "/" + CAMERAOFFLINEH264FILE)) {
             this.camera_offline_h264_frame = fs.readFileSync(__dirname + "/" + CAMERAOFFLINEH264FILE);
-            // remove any H264 NALU from being of any video data
-            if (this.camera_offline_h264_frame.length >= 3 && this.camera_offline_h264_frame[0] == 0x00 && this.camera_offline_h264_frame[1] == 0x00 && this.camera_offline_h264_frame[2] == 0x00 && this.camera_offline_h264_frame[3] == 0x01) {
-                this.camera_offline_h264_frame = this.camera_offline_h264_frame.slice(4);
+            // remove any H264 NALU from being of any video data. We do this as they are added later when output by our ffmpeg router
+            if (this.camera_offline_h264_frame.indexOf(H264NALUnit) == 0) {
+                this.camera_offline_h264_frame = this.camera_offline_h264_frame.slice(H264NALUnit.length);
             }
         }
 
@@ -229,9 +230,9 @@ class NexusStreamer {
         this.camera_off_h264_frame = null;
         if (fs.existsSync(__dirname + "/" + CAMERAOFFH264FILE)) {
             this.camera_off_h264_frame = fs.readFileSync(__dirname + "/" + CAMERAOFFH264FILE);
-            // remove any H264 NALU from being of any video data
-            if (this.camera_off_h264_frame.length >= 3 && this.camera_off_h264_frame[0] == 0x00 && this.camera_off_h264_frame[1] == 0x00 && this.camera_off_h264_frame[2] == 0x00 && this.camera_off_h264_frame[3] == 0x01) {
-                this.camera_off_h264_frame = this.camera_off_h264_frame.slice(4);
+            // remove any H264 NALU from being of any video data. We do this as they are added later when output by our ffmpeg router
+            if (this.camera_off_h264_frame.indexOf(H264NALUnit) == 0) {
+                this.camera_off_h264_frame = this.camera_off_h264_frame.slice(H264NALUnit.length);
             }
         }
 
@@ -463,12 +464,12 @@ NexusStreamer.prototype.__connect = function(host) {
         if (this.camera.online == false) {
             // Camera is offline, so feed in our custom h264 frame for playback
             this.__ffmpegRouter("video", this.camera_offline_h264_frame);
-            this.__ffmpegRouter("audio", Buffer.from(AACMONO48000BLANK));
+            this.__ffmpegRouter("audio", AACMONO48000BLANK);
         }
         if (this.camera.streaming_enabled == false && this.camera.online == true) {
             // Camera video is turned off so feed in our custom h264 frame for playback
             this.__ffmpegRouter("video", this.camera_off_h264_frame);
-            this.__ffmpegRouter("audio", Buffer.from(AACMONO48000BLANK));
+            this.__ffmpegRouter("audio", AACMONO48000BLANK);
         }
     }, (TIMERINTERVAL / 30));   // output at 30 fps?
 }
@@ -546,7 +547,7 @@ NexusStreamer.prototype.__ffmpegRouter = function(type, data) {
             if (ffmpeg.aligned == true) {
                 if (type == "video" && ffmpeg.video != null) {
                     // H264 NAL Units "0001" are required to be added to beginning of any video data we output
-                    ffmpeg.video.write(Buffer.concat([Buffer.from(H264NALUnit), data]));
+                    ffmpeg.video.write(Buffer.concat([H264NALUnit, data]));
                 }
                 if (type == "audio" && ffmpeg.audio != null) { 
                     ffmpeg.audio.write(data);
@@ -567,7 +568,7 @@ NexusStreamer.prototype.__ffmpegRouter = function(type, data) {
                         // Send anything in buffer from this position
                         if (bufferData.type == "video" && ffmpeg.video != null) {
                             // H264 NAL Units "0001" are required to be added to beginning of any video data
-                            ffmpeg.video.write(Buffer.concat([Buffer.from(H264NALUnit), bufferData.data]));
+                            ffmpeg.video.write(Buffer.concat([H264NALUnit, bufferData.data]));
                         }
                         if (bufferData.type == "audio" && ffmpeg.audio != null) {
                             ffmpeg.audio.write(bufferData.data);
@@ -578,7 +579,7 @@ NexusStreamer.prototype.__ffmpegRouter = function(type, data) {
                 // Since didnt need to empty buffer first, send on any new data
                 if (type == "video" && ffmpeg.video != null) {
                     // H264 NAL Units "0001" are required to be added to beginning of any video data we output
-                    ffmpeg.video.write(Buffer.concat([Buffer.from(H264NALUnit), data]));
+                    ffmpeg.video.write(Buffer.concat([H264NALUnit, data]));
                 }
                 if (type == "audio" && ffmpeg.audio != null) { 
                     ffmpeg.audio.write(data);
