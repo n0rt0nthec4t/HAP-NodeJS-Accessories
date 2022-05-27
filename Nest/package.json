@@ -8,13 +8,16 @@
       "url": "https://github.com/n0rt0nthec4t/HAP-NodeJS-Accessories"
     },
     "keywords": [
+        "homekit",
+        "hksv",
         "hap-nodejs",
         "nest",
         "doorbell",
         "camera",
         "thermostat",
         "temperature",
-        "smoke"
+        "smoke",
+        "sensor"
       ],
     "author": "Mark Hulskamp",
     "funding": [
