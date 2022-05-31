@@ -1,12 +1,11 @@
 // Nest devices in HomeKit using HAP-NodeJS Library
 //
 // Supported:
-// -- Nest Thermostat, includes custom integration of daikin A/C (wifi controlled) for cooling centrally controlled from Nest
+// -- Nest Thermostat
 // -- Nest Temperature Sensors
 // -- Nest Protect
 // -- Nest Hello/Cams with HomeKit Secure Video support
 //
-// Daikin A/C control https://github.com/ael-code/daikin-control
 // Nest "unoffical API" https://www.wiredprairie.us/blog/index.php/archives/1754
 // Unofficial Nest Learning Thermostat API https://github.com/gboudreau/nest-api
 // HomeBridge nest-cam https://github.com/Brandawg93/homebridge-nest-cam    <- camera coding taken/adapted from here
@@ -30,7 +29,7 @@
 //      -- "Hey Siri, turn on the fan for x minutes"????
 //      -- Changes triggered from HomeKit when in ECO mode
 //      -- Add leaf mode as custom HomeKit characteristic??
-//      -- Dynamic code for alternate external cooling/heating??
+//      -- Dehumidifier support
 //
 // -- Nest Protect
 //      -- Add replacement date as custom HomeKit characteristic??
@@ -75,6 +74,8 @@
 //      -- Fan service - dynamic add/remove also
 //      -- Option for seperate humidity sensor
 //      -- ECO mode temperatures reflect in HomeKit
+//      -- Dynamic code for external cooling/heating/fan/dehumidifier control
+//      -- Filter replacement status
 //
 // -- Nest Temperature Sensor
 //      -- Online status for Nest Temperature sensors
@@ -103,10 +104,12 @@
 //    Access token can be view by logging in to https//home.nest.com on webbrowser then in going to https://home.nest.com/session  Seems access token expires every 30days
 //    so needs manually updating (haven't seen it expire yet.....)
 //
-// Version 27/5/2022
+// Version 31/5/2022
 // Mark Hulskamp
 
 module.exports = accessories = [];
+
+"use strict";
 
 // Define HAP-NodeJS requirements
 var HAPNodeJS = require("hap-nodejs");
@@ -129,7 +132,6 @@ var MediaContainerType = HAPNodeJS.MediaContainerType;
 
 // Define external lbrary requirements
 var axios = require("axios");
-var EventEmitter = require("events");
 try {
     // Easier installation of ffmpeg binaries we support
     var ffmpegPath = require("ffmpeg-for-homebridge");
@@ -139,6 +141,7 @@ try {
 }
 
 // Define nodejs module requirements
+var EventEmitter = require("events");
 var dgram = require("dgram");
 var net = require("net");
 var ip = require("ip");
@@ -160,7 +163,7 @@ const NESTAPITIMEOUT = 10000;                               // Calls to Nest API
 const CAMERAALERTPOLLING = 2000;                            // Camera alerts polling timer
 const CAMERAZONEPOLLING = 30000;                            // Camera zones changes polling timer
 const LOWBATTERYLEVEL = 10;                                 // Low battery level percentage
-const CONFIGURATIONFILE = "Nest_config.json";
+const CONFIGURATIONFILE = "Nest_config.json";               // Default configuration file name, located in current directory
 const CAMERAOFFLINEJPGFILE = "Nest_camera_offline.jpg";     // Camera offline jpg image file
 const CAMERAOFFJPGFILE = "Nest_camera_off.jpg";             // Camera off jpg image file
 const CAMERAOFFLINEH264FILE = "Nest_camera_offline.h264";   // Camera offline H264 frame file
@@ -186,7 +189,7 @@ const AudioCodecs = {
 
 // Create the Nest system object
 class NestClass extends EventEmitter {
-	constructor() {
+	constructor(configFile) {
         super();
 
         this.nestToken = "";                        // Access token for Nest API requests
@@ -219,8 +222,9 @@ class NestClass extends EventEmitter {
         };
 
         // Load configuration
-        if (fs.existsSync(__dirname + "/" + CONFIGURATIONFILE) == true) {
-            var config = require(__dirname + "/" + CONFIGURATIONFILE);
+        
+        if (fs.existsSync(configFile) == true) {
+            var config = require(configFile);
 
             config && Object.entries(config).forEach(([key, value]) => {
                 // Process configuration items
@@ -271,6 +275,35 @@ class NestClass extends EventEmitter {
                             if (value < 1000) value = value * 1000;  // If less 1000, assume seconds value passed in, so convert to milliseconds
                             this.extraOptions[key]["personCooldown"] = value;   // Person detected cooldown time for this device
                         }
+                        if (subKey.toUpperCase() == "HUMIDITYSENSOR" && typeof value == "boolean") this.extraOptions[key]["humiditySensor"] = value;    // Seperate humidity sensor for this device. Only valid for thermostats
+                        if (subKey.toUpperCase() == "EXTERNALCOOL" && typeof value == "string") {
+                            try {
+                                this.extraOptions[key]["externalCool"] = require(value);  // Try to load external library for thermostat to perform cooling function
+                            } catch (error) {
+                                // do nothing
+                            }
+                        } 
+                        if (subKey.toUpperCase() == "EXTERNALHEAT" && typeof value == "string") {
+                            try {
+                                this.extraOptions[key]["externalHeat"] = require(value);  // Try to load external library for thermostat to perform heating function
+                            } catch (error) {
+                                // do nothing
+                            }
+                        } 
+                        if (subKey.toUpperCase() == "EXTERNALFAN" && typeof value == "string") {
+                            try {
+                                this.extraOptions[key]["externalFan"] = require(value);  // Try to load external library for thermostat to perform fan function
+                            } catch (error) {
+                                // do nothing
+                            }
+                        }
+                        if (subKey.toUpperCase() == "EXTERNALDEHUMIDIFIER" && typeof value == "string") {
+                            try {
+                                this.extraOptions[key]["externalDehumidifier"] = require(value);  // Try to load external library for thermostat to perform dehumidifier function
+                            } catch (error) {
+                                // do nothing
+                            }
+                        } 
                         if (subKey.split('.')[0].toUpperCase() == "OPTION" && subKey.split('.')[1]) {
                             // device options we'll insert into the Nest data for non excluded devices
                             // also allows us to override existing Nest data for the device, such as MAC address etc
@@ -307,9 +340,7 @@ function ThermostatClass() {
     this.OccupancyService = null;               // Status of Away/Home
     this.HumidityService = null;                // Seperate humidity sensor
     this.FanService = null;                     // Fan service
-    this.nestCanHeat = null;
-    this.nestCanCool = null;
-    this.nestHasFan = null;
+    this.DehumidifierService = null;            // Dehumidifier service
     this.updatingHomeKit = false;               // Flag if were doing an HomeKit update or not
     this.historyService = null;                 // History logging service
 }
@@ -355,8 +386,8 @@ function CameraClass() {
     this.doorbellTimer = null;                  // Cooldown timer for doorbell events
     this.personTimer = null;                    // Cooldown timer for person/face events
     this.motionTimer = null;                    // Cooldown timer for motion events
-    this.twoWayAudio = false;                   // Do we support twoway audio
-    this.NexusStreamer =  null;                 // Object for the Nexus Streamer. Created when adding doorbell/camera
+    this.audioTalkback = false;                 // Do we support audio talkback 
+    this.NexusStreamer = null;                  // Object for the Nexus Streamer. Created when adding doorbell/camera
     this.events = null;                         // Event emitter for this doorbell/camera
     this.historyService = null;                 // History logging service
 
@@ -378,12 +409,14 @@ ThermostatClass.prototype.addThermostat = function(HomeKitAccessory, thisService
     this.ThermostatService = HomeKitAccessory.addService(Service.Thermostat, "Thermostat", 1);
     this.ThermostatService.addCharacteristic(Characteristic.StatusActive);
     this.ThermostatService.addCharacteristic(Characteristic.LockPhysicalControls);    // Setting can only be accessed via Eve App (or other 3rd party).
+    deviceData.has_air_filter && this.ThermostatService.addCharacteristic(Characteristic.FilterChangeIndication);   // Add characteristic if has air filter
+    deviceData.has_humidifier && this.ThermostatService.addCharacteristic(Characteristic.TargetRelativeHumidity);   // Add characteristic if has dehumidifier
 
     // Add battery service to display battery level
     this.BatteryService = HomeKitAccessory.addService(Service.BatteryService, "", 1);
 
     // Seperate humidity sensor if configured todo so
-    if (deviceData.humidity_sensor && deviceData.humidity_sensor == true) {
+    if (deviceData.humiditySensor && deviceData.humiditySensor == true) {
         this.HumidityService = HomeKitAccessory.addService(Service.HumiditySensor, "Humidity", 1);      // Humidity will be listed under seperate sensor
         this.HumidityService.addCharacteristic(Characteristic.StatusActive);
     } else {
@@ -415,7 +448,13 @@ ThermostatClass.prototype.addThermostat = function(HomeKitAccessory, thisService
         this.FanService = HomeKitAccessory.addService(Service.Fan, "Fan", 1);
         this.FanService.getCharacteristic(Characteristic.On).on("set", this.setFan.bind(this));
     }
-    
+
+    // Add dehumidifier service if Nest supports a dehumidifier
+    if (deviceData.has_humidifier == true) {
+        this.DehumidifierService = HomeKitAccessory.addService(Service.HumidifierDehumidifier, "Dehumidifier", 1);
+        this.DehumidifierService.getCharacteristic(Characteristic.TargetHumidifierDehumidifierState).setProps({validValues: [Characteristic.TargetHumidifierDehumidifierState.DEHUMIDIFIER]});  
+    }
+
     // Set default ranges - based on celsuis ranges
     this.ThermostatService.setCharacteristic(Characteristic.TemperatureDisplayUnits, Characteristic.TemperatureDisplayUnits.CELSIUS);
     this.ThermostatService.getCharacteristic(Characteristic.CurrentTemperature).setProps({minStep: 0.5});
@@ -437,6 +476,10 @@ ThermostatClass.prototype.addThermostat = function(HomeKitAccessory, thisService
 
     this.updateHomeKit(HomeKitAccessory, deviceData);  // Do initial HomeKit update
     console.log("Setup Nest Thermostat '%s' on '%s'", thisServiceName, HomeKitAccessory.username, (this.HumidityService != null ? "with seperate humidity sensor" : ""));
+    deviceData.externalCool && console.log("  += using external cooling");
+    deviceData.externalHeat && console.log("  += using external heating");
+    deviceData.externalFan && console.log("  += using external fan");
+    deviceData.externalDehumidifier && console.log("  += using external dehumidification");
 }
 
 ThermostatClass.prototype.setFan = function(value, callback) {
@@ -473,23 +516,23 @@ ThermostatClass.prototype.setMode = function(value, callback) {
         var tempMode = "";
         var tempValue = null;
 
-        if (value == Characteristic.TargetHeatingCoolingState.HEAT && this.nestCanHeat == true) {
+        if (value == Characteristic.TargetHeatingCoolingState.HEAT && this.nestObject.nestDevices[this.deviceID].can_heat == true) {
             tempMode = "heat";
             tempValue = Characteristic.TargetHeatingCoolingState.HEAT;
         }
-        if (value == Characteristic.TargetHeatingCoolingState.COOL && this.nestCanCool == true) {
+        if (value == Characteristic.TargetHeatingCoolingState.COOL && this.nestObject.nestDevices[this.deviceID].can_cool == true) {
             tempMode = "cool";
             tempValue = Characteristic.TargetHeatingCoolingState.COOL;
         }
         if (value == Characteristic.TargetHeatingCoolingState.AUTO) {
             // Workaround for "Hey Siri, turn on my thermostat". Appears to automatically request mode as "auto", but we need to see what Nest device supports
-            if (this.nestCanCool == true && this.nestCanHeat == true) {
+            if (this.nestObject.nestDevices[this.deviceID].can_cool == true && this.nestObject.nestDevices[this.deviceID].can_heat == true) {
                 tempMode = "range";
                 tempValue = Characteristic.TargetHeatingCoolingState.AUTO;
-            } else if (this.nestCanCool == true && this.nestCanHeat == false) {
+            } else if (this.nestObject.nestDevices[this.deviceID].can_cool == true && this.nestObject.nestDevices[this.deviceID].can_heat == false) {
                 tempMode = "cool";
                 tempValue = Characteristic.TargetHeatingCoolingState.COOL;
-            } else if (this.nestCanCool == false && this.nestCanHeat == true) {
+            } else if (this.nestObject.nestDevices[this.deviceID].can_cool == false && this.nestObject.nestDevices[this.deviceID].can_heat == true) {
                 tempMode = "heat";
                 tempValue = Characteristic.TargetHeatingCoolingState.HEAT;
             } else {
@@ -565,6 +608,7 @@ ThermostatClass.prototype.updateHomeKit = function(HomeKitAccessory, deviceData)
             this.ThermostatService.updateCharacteristic(Characteristic.CurrentTemperature, deviceData.active_temperature);
             this.ThermostatService.updateCharacteristic(Characteristic.StatusActive, (deviceData.online == true && deviceData.removed_from_base == false) ? true : false);  // If Nest isn't online or removed from base, report in HomeKit
             this.ThermostatService.updateCharacteristic(Characteristic.LockPhysicalControls, deviceData.temperature_lock == true ? Characteristic.LockPhysicalControls.CONTROL_LOCK_ENABLED : Characteristic.LockPhysicalControls.CONTROL_LOCK_DISABLED);
+            deviceData.has_air_filter && this.ThermostatService.updateCharacteristic(Characteristic.FilterChangeIndication, (deviceData.filter_replacement_needed == true ? Characteristic.FilterChangeIndication.CHANGE_FILTER : Characteristic.FilterChangeIndication.FILTER_OK));
             
             // Update HomeKit steps and ranges for temperatures
             // Do we limit ranges when childlock on????
@@ -591,24 +635,35 @@ ThermostatClass.prototype.updateHomeKit = function(HomeKitAccessory, deviceData)
                 this.ThermostatService.updateCharacteristic(Characteristic.CurrentRelativeHumidity, deviceData.current_humidity);    // Humidity will be listed under thermostat only
             }
 
-            // fan setup has changed on thermostat
-            if (this.nestHasFan != deviceData.has_fan) {
-                if (this.nestHasFan == false && deviceData.has_fan == true && this.FanService == null) {
+            // Check for fan setup change on thermostat
+            if (typeof this.nestObject.previousDevices[this.deviceID] == "object" && this.nestObject.previousDevices[this.deviceID].has_fan != deviceData.has_fan) {
+                if (this.nestObject.previousDevices[this.deviceID].has_fan == false && deviceData.has_fan == true && this.FanService == null) {
                     // A fan has been added
                     this.FanService = HomeKitAccessory.addService(Service.Fan, "Fan", 1);
                     this.FanService.getCharacteristic(Characteristic.On).on("set", this.setFan.bind(this));
                 }
-                if (this.nestHasFan == true && deviceData.has_fan == false && this.FanService != null) {
+                if (this.nestObject.previousDevices[this.deviceID].has_fan == true && deviceData.has_fan == false && this.FanService != null) {
                     // A fan has been removed
                     HomeKitAccessory.removeService(this.FanService);
                     this.FanService = null;
                 }
             }
 
-            // Update fan mode
-            this.nestHasFan = deviceData.has_fan;
+            // Check for Dehumidifier setup change on thermostat
+            if (typeof this.nestObject.previousDevices[this.deviceID] == "object" && this.nestObject.previousDevices[this.deviceID].has_humidifier != deviceData.has_humidifier) {
+                if (this.nestObject.previousDevices[this.deviceID].has_humidifier == false && deviceData.has_humidifier == true && this.DehumidifierService == null) {
+                    // A dehumidifier has been added
+                    this.DehumidifierService = HomeKitAccessory.addService(Service.HumidifierDehumidifier, "Dehumidifier", 1);
+                    this.DehumidifierService.getCharacteristic(Characteristic.TargetHumidifierDehumidifierState).setProps({validValues: [Characteristic.TargetHumidifierDehumidifierState.DEHUMIDIFIER]});  
+                }
+                if (this.nestObject.previousDevices[this.deviceID].has_humidifier == true && deviceData.has_humidifier == false && this.DehumidifierService != null) {
+                    // A fan has been removed
+                    HomeKitAccessory.removeService(this.DehumidifierService);
+                    this.DehumidifierService = null;
+                }
+            }
 
-            if (this.nestCanCool != deviceData.can_cool || this.nestCanHeat != deviceData.can_heat) {
+            if (typeof this.nestObject.previousDevices[this.deviceID] == "object" && (this.nestObject.previousDevices[this.deviceID].can_cool != deviceData.can_cool || this.nestObject.previousDevices[this.deviceID].can_heat != deviceData.can_heat)) {
                 // Heating and/cooling setup has changed on thermostat
 
                 // Limit prop ranges
@@ -630,10 +685,6 @@ ThermostatClass.prototype.updateHomeKit = function(HomeKitAccessory, deviceData)
                     this.ThermostatService.getCharacteristic(Characteristic.TargetHeatingCoolingState).setProps({validValues: [Characteristic.TargetHeatingCoolingState.OFF]});
                 }
             } 
-
-            // update cooling/heating modes
-            this.nestCanCool = deviceData.can_cool;
-            this.nestCanHeat = deviceData.can_heat;
 
             // Update current mode temperatures
             if (deviceData.hvac_mode.toUpperCase() == "HEAT" || (deviceData.hvac_mode.toUpperCase() == "ECO" && deviceData.target_temperature_type.toUpperCase() == "HEAT")) {
@@ -670,54 +721,57 @@ ThermostatClass.prototype.updateHomeKit = function(HomeKitAccessory, deviceData)
 
             // Update current state
             if (deviceData.hvac_state.toUpperCase() == "HEATING") {
-                if (deviceData.previous_hvac_state.toUpperCase() == "COOLING" && deviceData.coolingURL) {
-                    // Switched to heating mode and external cooling URL was being used, so stop cooling via cooling URL
-                    __setDaikinAC(deviceData.coolingURL, 0, 3, deviceData.target_temperature_high, 0, "A", 3, this.nestObject.config.debug);
+                if (deviceData.previous_hvac_state.toUpperCase() == "COOLING" && typeof deviceData.externalCool == "object") {
+                    // Switched to heating mode and external cooling URL was being used, so stop cooling via cooling external code
+                    if (typeof deviceData.externalCool.off == "function") deviceData.externalCool.off(this.nestObject.config.debug);
                 }
-                if (deviceData.previous_hvac_state.toUpperCase() != "HEATING" && deviceData.heatingURL) {
-                    // Switched to heating mode and external heating URL is being used, so start heating via heating URL
-                    // Insert code here to startup external heating source
+                if (deviceData.previous_hvac_state.toUpperCase() != "HEATING" && typeof deviceData.externalHeat == "object") {
+                    // Switched to heating mode and external heating URL is being used, so start heating via heating external code
+                    if (typeof deviceData.externalHeat.heat == "function") deviceData.externalHeat.heat(deviceData.target_temperature, this.nestObject.config.debug);
                 }
                 this.ThermostatService.updateCharacteristic(Characteristic.CurrentHeatingCoolingState, Characteristic.CurrentHeatingCoolingState.HEAT);
                 historyEntry.status = 2;    // heating
             }
             if (deviceData.hvac_state.toUpperCase() == "COOLING") {
-                if (deviceData.previous_hvac_state.toUpperCase() == "HEATING" && deviceData.heatingURL) {
-                    // Switched to cooling mode and external heating URL was being used, so stop heating via heating URL
-                    // Insert code here to stop external heating source
+                if (deviceData.previous_hvac_state.toUpperCase() == "HEATING" && typeof deviceData.externalHeat == "object") {
+                    // Switched to cooling mode and external heating URL was being used, so stop heating via heating external code
+                    if (typeof deviceData.externalHeat.off == "function") deviceData.externalHeat.off(this.nestObject.config.debug);
                 }
-                if (deviceData.previous_hvac_state.toUpperCase() != "COOLING" && deviceData.coolingURL) {
-                    // Switched to cooling mode and external cooling URL is being used, so start cooling via cooling URL
-                    __setDaikinAC(deviceData.coolingURL, 1, 3, this.ThermostatService.getCharacteristic(Characteristic.TargetTemperature).value, 0, "A", 3, this.nestObject.config.debug);
+                if (deviceData.previous_hvac_state.toUpperCase() != "COOLING" && typeof deviceData.externalCool == "object") {
+                    // Switched to cooling mode and external cooling URL is being used, so start cooling via cooling external code
+                    if (typeof deviceData.externalCool.cool == "function") deviceData.externalCool.cool(deviceData.target_temperature, this.nestObject.config.debug);
                 }
                 this.ThermostatService.updateCharacteristic(Characteristic.CurrentHeatingCoolingState, Characteristic.CurrentHeatingCoolingState.COOL);
                 historyEntry.status = 3;    // cooling
             }
             if (deviceData.hvac_state.toUpperCase() == "OFF") {
-                if (deviceData.previous_hvac_state.toUpperCase() == "COOLING" && deviceData.coolingURL) {
-                    // Switched to off mode and external cooling URL was being used, so stop cooling via cooling URL
-                    __setDaikinAC(deviceData.coolingURL, 0, 3, deviceData.target_temperature, 0, "A", 3, this.nestObject.config.debug);
+                if (deviceData.previous_hvac_state.toUpperCase() == "COOLING" && typeof deviceData.externalCool == "object") {
+                    // Switched to off mode and external cooling URL was being used, so stop cooling via cooling external code
+                    if (typeof deviceData.externalCool.off == "function") deviceData.externalCool.off(this.nestObject.config.debug);
                 }
-                if (deviceData.previous_hvac_state.toUpperCase() == "HEATING" && deviceData.heatingURL) {
-                    // Switched to off mode and external heating URL was being used, so stop heating via heating URL
-                    // Insert code here to stop external heating source
+                if (deviceData.previous_hvac_state.toUpperCase() == "HEATING" && typeof deviceData.externalHeat == "object") {
+                    // Switched to off mode and external heating URL was being used, so stop heating via heating external code
+                    if (typeof deviceData.externalHeat.heat == "function") deviceData.externalHeat.off(this.nestObject.config.debug);
                 }
                 this.ThermostatService.updateCharacteristic(Characteristic.CurrentHeatingCoolingState, Characteristic.CurrentHeatingCoolingState.OFF);
                 historyEntry.status = 0;    // off
             }
-
             if (this.FanService != null) {
-                if (deviceData.previous_fan_state = false && deviceData.fan_state == true) {
+                if (deviceData.previous_fan_state = false && deviceData.fan_state == true && typeof deviceData.externalFan == "object") {
                     // Fan mode was switched on and external fan URL is being used, so start fan via fan URL
-                    deviceData.fanURL && __setDaikinAC(deviceData.fanURL, 1, 6, "--", "--", "A", 3, this.nestObject.config.debug);
+                    if (typeof deviceData.externalFan.fan == "function") deviceData.externalFan.fan(0, this.nestObject.config.debug);    // Fan speed will be auto
                 }
-                if (deviceData.previous_fan_state == true && deviceData.fan_state == false) {
+                if (deviceData.previous_fan_state == true && deviceData.fan_state == false && typeof deviceData.externalFan == "object") {
                     // Fan mode was switched off and external fan URL was being used, so stop fan via fan URL
-                    deviceData.fanURL && __setDaikinAC(deviceData.fanURL, 0, 3, deviceData.target_temperature, 0, "A", 3, this.nestObject.config.debug);
+                    if (typeof deviceData.externalFan.off == "function") deviceData.externalFan.off(this.nestObject.config.debug);
                 }
 
                 this.FanService.updateCharacteristic(Characteristic.On, deviceData.fan_state);   // fan status on or off
                 historyEntry.status = 1;    // fan
+            }
+            if (this.DehumidifierService != null) {
+                this.ThermostatService.updateCharacteristic(Characteristic.TargetRelativeHumidity, deviceData.target_humidity);
+                historyEntry.status = 4;    // dehumifiying 
             }
 
             // Log thermostat metrics to history only if changed to previous recording
@@ -1366,8 +1420,8 @@ CameraClass.prototype.prepareStream = async function(request, callback) {
 
         audioPort: request.audio.port,
         localAudioPort: await __getPort(),
-        twoWayAudioPort: await __getPort(),
-        audioServerPort: await __getPort(),
+        audioTalkbackPort: await __getPort(),
+        rptSplitterPort: await __getPort(),
         audioCryptoSuite: request.video.srtpCryptoSuite,
         audioSRTP: Buffer.concat([request.audio.srtp_key, request.audio.srtp_salt]),
         audioSSRC: CameraController.generateSynchronisationSource(),
@@ -1377,26 +1431,6 @@ CameraClass.prototype.prepareStream = async function(request, callback) {
         video: null,
         audio: null
     };
-
-    // setup for splitting audio stream into seperate parts to allow two/way audio
-    // only need if two/way audio enabled
-    if (this.nestObject.nestDevices[this.deviceID].audio_enabled == true && this.twoWayAudio == true) {
-        sessionInfo.rtpSplitter = dgram.createSocket("udp4");
-        sessionInfo.rtpSplitter.on("error", (error) => {
-            sessionInfo.rtpSplitter.close();
-        });
-        sessionInfo.rtpSplitter.on("message", (message) => {
-            payloadType = (message.readUInt8(1) & 0x7f);
-            if (payloadType > 90 || payloadType === 0) {
-                sessionInfo.rtpSplitter.send(message, sessionInfo.twoWayAudioPort, "localhost");
-            } else {
-                sessionInfo.rtpSplitter.send(message, sessionInfo.localAudioPort, "localhost");
-                // Send RTCP to return audio as a heartbeat
-                sessionInfo.rtpSplitter.send(message, sessionInfo.twoWayAudioPort, "localhost");
-            }
-        });
-        sessionInfo.rtpSplitter.bind(sessionInfo.audioServerPort);
-    }
 
     // Build response back to HomeKit with our details
     var response = {
@@ -1408,7 +1442,7 @@ CameraClass.prototype.prepareStream = async function(request, callback) {
             srtp_salt: request.video.srtp_salt,
         },
         audio: {
-            port: sessionInfo.audioServerPort,
+            port: sessionInfo.rptSplitterPort,
             ssrc: sessionInfo.audioSSRC,
             srtp_key: request.audio.srtp_key,
             srtp_salt: request.audio.srtp_salt,
@@ -1442,7 +1476,7 @@ CameraClass.prototype.handleStreamRequest = async function (request, callback) {
                 + " -payload_type " + request.video.pt
                 + " -ssrc " + this.ongoingSessions[request.sessionID].videoSSRC
                 + " -f rtp"
-                + " -srtp_out_suite AES_CM_128_HMAC_SHA1_80 -srtp_out_params " + this.ongoingSessions[request.sessionID].videoSRTP.toString("base64")
+                + " -srtp_out_suite " + SRTPCryptoSuites[this.ongoingSessions[request.sessionID].videoCryptoSuite] + " -srtp_out_params " + this.ongoingSessions[request.sessionID].videoSRTP.toString("base64")
                 + " srtp://" + this.ongoingSessions[request.sessionID].address + ":" + this.ongoingSessions[request.sessionID].videoPort + "?rtcpport=" + this.ongoingSessions[request.sessionID].videoPort + "&localrtcpport=" + this.ongoingSessions[request.sessionID].localVideoPort + "&pkt_size=" + request.video.mtu;
 
             // We have seperate video and audio streams that need to be muxed together if audio enabled
@@ -1458,7 +1492,7 @@ CameraClass.prototype.handleStreamRequest = async function (request, callback) {
                     + " -payload_type " + request.audio.pt
                     + " -ssrc " + this.ongoingSessions[request.sessionID].audioSSRC
                     + " -f rtp"
-                    + " -srtp_out_suite AES_CM_128_HMAC_SHA1_80 -srtp_out_params " + this.ongoingSessions[request.sessionID].audioSRTP.toString("base64")
+                    + " -srtp_out_suite " + SRTPCryptoSuites[this.ongoingSessions[request.sessionID].audioCryptoSuite] + " -srtp_out_params " + this.ongoingSessions[request.sessionID].audioSRTP.toString("base64")
                     + " srtp://" + this.ongoingSessions[request.sessionID].address + ":" + this.ongoingSessions[request.sessionID].audioPort + "?rtcpport=" + this.ongoingSessions[request.sessionID].audioPort + "&localrtcpport=" + this.ongoingSessions[request.sessionID].localAudioPort + "&pkt_size=188";
             }
 
@@ -1482,16 +1516,38 @@ CameraClass.prototype.handleStreamRequest = async function (request, callback) {
 
             ffmpegStreaming.on("exit", (code, signal) => {
                 if (signal != "SIGKILL" || signal == null) {
-                    this.nestObject.config.debug && console.debug("[FFMPEG] Video stream stopped", code, signal);
-                    if (typeof callback == "function") callback(new Error("Video Stream stopped"));
+                    this.nestObject.config.debug && console.debug("[FFMPEG] Audio/Video streaming processes stopped", code, signal);
+                    if (typeof callback == "function") callback(new Error("ffmpeg process creation failed!"));
                     callback = null;    // Signal we've done the callback by clearing it
                     this.controller.forceStopStreamingSession(request.sessionID);
                 }
             });
 
-            // We only create the ffmpeg process if twoway audio is supported AND audio enabled on doorbell/camera
-            var ffmpegAudioReturn = null;   // No ffmpeg process for return audio yet
-            if (this.ongoingSessions[request.sessionID].rtpSplitter != null) {
+            // We only create the the rtpsplitter and ffmpeg processs if twoway audio is supported AND audio enabled on doorbell/camera
+            var ffmpegAudioTalkback = null;   // No ffmpeg process for return audio yet
+            if (includeAudio == true && this.audioTalkback == true) {
+                // Setup RTP splitter for two/away audio
+                this.ongoingSessions[request.sessionID].rtpSplitter = dgram.createSocket("udp4");
+                this.ongoingSessions[request.sessionID].rtpSplitter.on("error", (error) => {
+                    this.ongoingSessions[request.sessionID].rtpSplitter.close();
+                });
+                this.ongoingSessions[request.sessionID].rtpSplitter.on("message", (message) => {
+                    payloadType = (message.readUInt8(1) & 0x7f);
+                    if (payloadType == request.audio.pt) {
+                        // Audio payload type from HomeKit should match our payload type for audio
+                        if (message.length > 50) {
+                            // Only send on audio data if we have a longer audio packet. Helps filter background noise?
+                            this.ongoingSessions[request.sessionID].rtpSplitter.send(message, this.ongoingSessions[request.sessionID].audioTalkbackPort);
+                        }
+                    } else {
+                        this.ongoingSessions[request.sessionID].rtpSplitter.send(message, this.ongoingSessions[request.sessionID].localAudioPort);
+                        // Send RTCP to return audio as a heartbeat
+                        this.ongoingSessions[request.sessionID].rtpSplitter.send(message, this.ongoingSessions[request.sessionID].audioTalkbackPort);
+                    }
+                });
+                this.ongoingSessions[request.sessionID].rtpSplitter.bind(this.ongoingSessions[request.sessionID].rptSplitterPort);
+
+                // Build ffmpeg command
                 var ffmpegCommand = "-hide_banner"
                     + " -protocol_whitelist pipe,udp,rtp,file,crypto"
                     + " -f sdp"
@@ -1504,38 +1560,45 @@ CameraClass.prototype.handleStreamRequest = async function (request, callback) {
                     + " -ar " + request.audio.sample_rate + "k"
                     + " -f data pipe:1";
             
-                ffmpegAudioReturn = spawn(ffmpegPath || "ffmpeg", ffmpegCommand.split(" "), { env: process.env });
-                ffmpegAudioReturn.on("error", (error) => {
-                    this.nestObject.config.debug && console.debug("[FFMPEG] Failed to start Nest camera audio stream (speaker)", error.message);
+                ffmpegAudioTalkback = spawn(ffmpegPath || "ffmpeg", ffmpegCommand.split(" "), { env: process.env });
+                ffmpegAudioTalkback.on("error", (error) => {
+                    this.nestObject.config.debug && console.debug("[FFMPEG] Failed to start Nest camera talkback audio process", error.message);
                     if (typeof callback == "function") callback(new Error("ffmpeg process creation failed!"));
                     callback = null;    // Signal we've done the callback by clearing it
                 });
-            
+
+                ffmpegAudioTalkback.stderr.on("data", (data) => {
+                    // Uncomment below for ffmpeg output for audio talkback stream
+                    if (data.toString().includes("size=") == false) {
+                        //this.nestObject.config.debug && console.debug("[FFMPEG]", data.toString());
+                    }
+                });
+
                 // Write out SDP configuration
                 // Tried to align the SDP configuration to what HomeKit has sent us in its audio request details
-                ffmpegAudioReturn.stdin.write("v=0\n"
+                ffmpegAudioTalkback.stdin.write("v=0\n"
                     + "o=- 0 0 IN " + (this.ongoingSessions[request.sessionID].ipv6 ? "IP6" : "IP4") + " " + this.ongoingSessions[request.sessionID].address + "\n"
                     + "s=Nest Talkback\n"
                     + "c=IN " + (this.ongoingSessions[request.sessionID].ipv6 ? "IP6" : "IP4") + " " + this.ongoingSessions[request.sessionID].address + "\n"
                     + "t=0 0\n"
-                    + "m=audio " + this.ongoingSessions[request.sessionID].twoWayAudioPort + " RTP/AVP " + request.audio.pt + "\n"
+                    + "m=audio " + this.ongoingSessions[request.sessionID].audioTalkbackPort + " RTP/AVP " + request.audio.pt + "\n"
                     + "b=AS:" + request.audio.max_bit_rate + "\n"
                     + "a=ptime:" + request.audio.packet_time + "\n"
                     + "a=rtpmap:" + request.audio.pt + " MPEG4-GENERIC/" + (request.audio.sample_rate * 1000) + "/1\n"
                     + "a=fmtp:" + request.audio.pt + " profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;config=F8F0212C00BC00\n"
-                    + "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:" + this.ongoingSessions[request.sessionID].audioSRTP.toString('base64'));
-                ffmpegAudioReturn.stdin.end();
+                    + "a=crypto:1 " + SRTPCryptoSuites[this.ongoingSessions[request.sessionID].audioCryptoSuite] + " inline:" + this.ongoingSessions[request.sessionID].audioSRTP.toString('base64'));
+                ffmpegAudioTalkback.stdin.end();
             }
 
             // Store our ffmpeg sessions
             ffmpegStreaming && this.ongoingSessions[request.sessionID].ffmpeg.push(ffmpegStreaming);  // Store ffmpeg process ID
-            ffmpegAudioReturn && this.ongoingSessions[request.sessionID].ffmpeg.push(ffmpegAudioReturn);  // Store ffmpeg audio return process ID
+            ffmpegAudioTalkback && this.ongoingSessions[request.sessionID].ffmpeg.push(ffmpegAudioTalkback);  // Store ffmpeg audio return process ID
             this.ongoingSessions[request.sessionID].video = request.video;  // Cache the video request details
             this.ongoingSessions[request.sessionID].audio = request.audio;  // Cache the audio request details
 
             // Finally start the stream from nexus
             this.nestObject.config.debug && console.debug("[NEST] Live stream started on '%s'", this.nestObject.nestDevices[this.deviceID].mac_address);
-            this.NexusStreamer.startLiveStream("HK" + request.sessionID, ffmpegStreaming.stdin, (includeAudio == true ? ffmpegStreaming.stdio[3] : null), (this.twoWayAudio == true ? ffmpegAudioReturn.stdout : null));
+            this.NexusStreamer.startLiveStream("HK" + request.sessionID, ffmpegStreaming.stdin, (includeAudio == true ? ffmpegStreaming.stdio[3] : null), (this.audioTalkback == true ? ffmpegAudioTalkback.stdout : null));
             break;
         }
 
@@ -1587,7 +1650,7 @@ CameraClass.prototype.updateHomeKit = function(HomeKitAccessory, deviceData) {
         this.NexusStreamer && this.NexusStreamer.update(this.nestObject.nestCameraToken, this.nestObject.nestTokenType, deviceData);
 
         // If both speaker & microphone capabilities, then we support twoway audio
-        this.twoWayAudio = (deviceData.capabilities.includes("audio.speaker") && deviceData.capabilities.includes("audio.microphone")) ? true : false;
+        this.audioTalkback = (deviceData.capabilities.includes("audio.speaker") && deviceData.capabilities.includes("audio.microphone")) ? true : false;
 
         // For non-HKSV enabled devices, we process activity zone changes
         if (deviceData.HKSV == false && (JSON.stringify(deviceData.activity_zones) != this.nestObject.nestDevices[this.deviceID].activity_zones)) {
@@ -1964,6 +2027,7 @@ NestClass.prototype.__processNestData = function(nestData) {
                 this.nestDevices[thermostat.serial_number].removed_from_base = thermostat.nlclient_state.toUpperCase() == "BPD" ? true : false;
                 this.nestDevices[thermostat.serial_number].online = nestData.track[thermostat.serial_number].online;
                 this.nestDevices[thermostat.serial_number].has_fan = thermostat.has_fan;
+                this.nestDevices[thermostat.serial_number].has_humidifier = thermostat.has_humidifier;
                 this.nestDevices[thermostat.serial_number].leaf = thermostat.leaf;
                 this.nestDevices[thermostat.serial_number].can_cool = nestData.shared[thermostat.serial_number].can_cool;
                 this.nestDevices[thermostat.serial_number].can_heat = nestData.shared[thermostat.serial_number].can_heat;
@@ -2106,6 +2170,18 @@ NestClass.prototype.__processNestData = function(nestData) {
                 if (typeof nestData.schedule[thermostat.serial_number] == "object") {
                     this.nestDevices[thermostat.serial_number].schedules = nestData.schedule[thermostat.serial_number].days;
                 }
+
+                // Air filter details
+                this.nestDevices[thermostat.serial_number].has_air_filter = thermostat.has_air_filter;
+                this.nestDevices[thermostat.serial_number].filter_replacement_needed = thermostat.filter_replacement_needed;
+                this.nestDevices[thermostat.serial_number].filter_changed_date = thermostat.filter_changed_date;
+                this.nestDevices[thermostat.serial_number].filter_replacement_threshold_sec = thermostat.filter_replacement_threshold_sec;
+
+                // Humidifier/dehumidifier details
+                this.nestDevices[thermostat.serial_number].has_humidifier = thermostat.has_humidifier;
+                this.nestDevices[thermostat.serial_number].target_humidity = thermostat.target_humidity;
+                this.nestDevices[thermostat.serial_number].humidifier_state = thermostat.humidifier_state;
+                this.nestDevices[thermostat.serial_number].dehumidifier_state = thermostat.dehumidifier_state;
 
                 // Insert any extra options we've read in from configuration file
                 this.extraOptions[thermostat.serial_number] && Object.entries(this.extraOptions[thermostat.serial_number]).forEach(([key, value]) => {
@@ -2595,20 +2671,6 @@ function __makeValidHomeKitName(name) {
     return name.replace(/[^A-Za-z0-9 ,.-]/g, "").replace(/^[^a-zA-Z0-9]*/g, "").replace(/[^a-zA-Z0-9]+$/g, "");
 }
 
-async function __setDaikinAC(daikinURL, daikinPwr, daikinMode, daikinTemp, daikinHumid, daikinFanSpeed, daikinFanMode, debug) {
-    await axios.get(daikinURL + "/aircon/set_control_info?pow=" + daikinPwr + "&mode=" + daikinMode + "&stemp=" + daikinTemp + "&shum=" + daikinHumid + "&f_rate=" + daikinFanSpeed + "&f_dir=" + daikinFanMode)
-    .then(response => {
-        if (response.status == 200) {
-            debug && console.debug("[NEST] Sucessfully set DaikinAC with Pwr: '%s' Mode: '%s' Temp: '%s' Fan Mode: '%s' Fan Speed: '%s'", daikinPwr, daikinMode, daikinTemp, daikinFanMode, daikinFanSpeed);
-        } else {
-            debug && console.debug("[NEST] Failed to set DaikinAC. HTTP status returned", response.status);
-        }
-    })
-    .catch(error => {
-        debug && console.debug("[NEST] setDaikinAC failed", error.message);
-    });
-}
-
 async function __getPort(options) {
     return new Promise((resolve, reject) => {
         var server = net.createServer();
@@ -2791,9 +2853,22 @@ axios.interceptors.response.use(undefined, function axiosRetryInterceptor(err) {
 
 
 // Startup code
+// Check to see if a location/and configuration file was passed into use
+var configFile = __dirname + "/" + CONFIGURATIONFILE;
+if (process.argv.slice(2).length == 1) {  // We only process one arg
+    configFile = process.argv.slice(2)[0];   // Extract the file name from the argument passed in
+    if (configFile.indexOf("/") == -1) {
+        // Since no directory paths in the filename, pre-append the current path
+        configFile = __dirname + "/" + configFile;
+    }
+}
+
 console.log("Starting Nest devices HomeKit accessory. We're using HAP-NodeJS library v" + HAPNodeJS.HAPLibraryVersion());
-if (fs.existsSync(__dirname + "/Nest_config.json") == true) {
-    var nest = new NestClass();
+console.log("Using configuration file", configFile);
+
+// Check that the config file is present before continuing
+if (fs.existsSync(configFile) == true) {
+    var nest = new NestClass(configFile);
     if (nest.sessionToken != "" || nest.refreshToken != "") {
         nest.nestConnect()   // Initiate connection to Nest APIs with either the specified session or refresh tokens
         .then(() => {
