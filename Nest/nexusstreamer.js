@@ -213,6 +213,7 @@ class NexusStreamer {
         this.tokenType = tokenType;
 
         this.camera = cameraData; // Current camera data
+        this.talking = false;   // If "talk" is happening
 
         this.debug = typeof debug == "boolean" ? debug : false; // debug status
 
@@ -256,7 +257,7 @@ NexusStreamer.prototype.startBuffering = function(milliseconds) {
     this.debug && console.debug("[NEXUS] Started buffering from '%s' with size of '%s'", this.host, milliseconds);
 }
 
-NexusStreamer.prototype.startLiveStream = function(sessionID, videoStream, audioStream, audioReturnStream) {
+NexusStreamer.prototype.startLiveStream = function(sessionID, videoStream, audioStream, talkbackStream) {
     // Setup error catching for video/audio streams
     videoStream != null && videoStream.on("error", (error) => {
         // EPIPE errors??
@@ -271,15 +272,15 @@ NexusStreamer.prototype.startLiveStream = function(sessionID, videoStream, audio
         this.__startNexusData();
     }
     
-    // Should have an active connection here now, so can add video/audio stream handles for our ffmpeg router to handle
-    var index = (this.ffmpeg.push({type: "live", id: sessionID, video: videoStream, audio: audioStream, return: audioReturnStream, timeout: null, aligned: false, time: Date.now()}) - 1);
+    // Should have an active connection here now, so can add video/audio/talkback stream handles for our ffmpeg router to handle
+    var index = (this.ffmpeg.push({type: "live", id: sessionID, video: videoStream, audio: audioStream, talkback: talkbackStream, timeout: null, aligned: false, time: Date.now()}) - 1);
 
-    // Setup audio return streaming if configured and allowed
-    if (audioReturnStream != null) {
-        audioReturnStream.on("error", (error) => {
+    // Setup talkback audio stream if configured
+    if (talkbackStream != null) {
+        talkbackStream.on("error", (error) => {
             // EPIPE errors??
         });
-        audioReturnStream.on("data", (data) => {
+        talkbackStream.on("data", (data) => {
             // Received audio data to send onto nexus for output to doorbell/camera
             this.__AudioPayload(data);
 
@@ -862,6 +863,16 @@ NexusStreamer.prototype.__handleNexusData = function(data) {
 
                 case PacketType.REDIRECT : {
                     this.__handleRedirect(payload);
+                    break;
+                }
+
+                case PacketType.TALKBACK_BEGIN : {
+                    this.talking = true;
+                    break;
+                }
+
+                case PacketType.TALKBACK_END : {
+                    this.talking = true;
                     break;
                 }
 

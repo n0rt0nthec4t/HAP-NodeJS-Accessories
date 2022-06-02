@@ -278,6 +278,7 @@ class NestClass extends EventEmitter {
                         if (subKey.toUpperCase() == "HUMIDITYSENSOR" && typeof value == "boolean") this.extraOptions[key]["humiditySensor"] = value;    // Seperate humidity sensor for this device. Only valid for thermostats
                         if (subKey.toUpperCase() == "EXTERNALCOOL" && typeof value == "string") {
                             try {
+                                if (value.indexOf("/") == -1) value = __dirname + "/" + value;  // Since no directory paths in the filename, pre-append the current path
                                 this.extraOptions[key]["externalCool"] = require(value);  // Try to load external library for thermostat to perform cooling function
                             } catch (error) {
                                 // do nothing
@@ -285,6 +286,7 @@ class NestClass extends EventEmitter {
                         } 
                         if (subKey.toUpperCase() == "EXTERNALHEAT" && typeof value == "string") {
                             try {
+                                if (value.indexOf("/") == -1) value = __dirname + "/" + value;  // Since no directory paths in the filename, pre-append the current path
                                 this.extraOptions[key]["externalHeat"] = require(value);  // Try to load external library for thermostat to perform heating function
                             } catch (error) {
                                 // do nothing
@@ -292,6 +294,7 @@ class NestClass extends EventEmitter {
                         } 
                         if (subKey.toUpperCase() == "EXTERNALFAN" && typeof value == "string") {
                             try {
+                                if (value.indexOf("/") == -1) value = __dirname + "/" + value;  // Since no directory paths in the filename, pre-append the current path
                                 this.extraOptions[key]["externalFan"] = require(value);  // Try to load external library for thermostat to perform fan function
                             } catch (error) {
                                 // do nothing
@@ -299,6 +302,7 @@ class NestClass extends EventEmitter {
                         }
                         if (subKey.toUpperCase() == "EXTERNALDEHUMIDIFIER" && typeof value == "string") {
                             try {
+                                if (value.indexOf("/") == -1) value = __dirname + "/" + value;  // Since no directory paths in the filename, pre-append the current path
                                 this.extraOptions[key]["externalDehumidifier"] = require(value);  // Try to load external library for thermostat to perform dehumidifier function
                             } catch (error) {
                                 // do nothing
@@ -1134,16 +1138,16 @@ CameraClass.prototype.handleRecordingStreamRequest = async function *(streamId) 
 
         if (recordCodec == VideoCodecs.LIBX264 || recordCodec == VideoCodecs.H264_OMX || recordCodec == VideoCodecs.H264_V4L2M2M) {
             // Configure for libx264 (software encoder) or H264_omx (RPI Hardware enccoder)
-            var ffmpegVideo = ffmpegVideo 
-            + " -pix_fmt yuv420p"
-            + (recordCodec != VideoCodecs.H264_V4L2M2M ? " -profile:v " + ((this.HKSVRecordingConfig.videoCodec.parameters.profile == H264Profile.HIGH) ? "high" : (this.HKSVRecordingConfig.videoCodec.parameters.profile == H264Profile.MAIN) ? "main" : "baseline") : "")
-            + (recordCodec == VideoCodecs.LIBX264 ? " -level:v " + ((this.HKSVRecordingConfig.videoCodec.parameters.level == H264Level.LEVEL4_0) ? "4.0" : (this.HKSVRecordingConfig.videoCodec.parameters.level == H264Level.LEVEL3_2) ? "3.2" : "3.1") : "")
-            + (recordCodec == VideoCodecs.LIBX264 ? " -preset veryfast" : "")
-            + " -b:v " + this.HKSVRecordingConfig.videoCodec.parameters.bitRate + "k"
-            + " -filter:v fps=" + this.HKSVRecordingConfig.videoCodec.resolution[2]; // convert to framerate HomeKit has requested
+                ffmpegVideo = ffmpegVideo 
+                + " -pix_fmt yuv420p"
+                + (recordCodec != VideoCodecs.H264_V4L2M2M ? " -profile:v " + ((this.HKSVRecordingConfig.videoCodec.parameters.profile == H264Profile.HIGH) ? "high" : (this.HKSVRecordingConfig.videoCodec.parameters.profile == H264Profile.MAIN) ? "main" : "baseline") : "")
+                + (recordCodec == VideoCodecs.LIBX264 ? " -level:v " + ((this.HKSVRecordingConfig.videoCodec.parameters.level == H264Level.LEVEL4_0) ? "4.0" : (this.HKSVRecordingConfig.videoCodec.parameters.level == H264Level.LEVEL3_2) ? "3.2" : "3.1") : "")
+                + (recordCodec == VideoCodecs.LIBX264 ? " -preset veryfast" : "")
+                + " -b:v " + this.HKSVRecordingConfig.videoCodec.parameters.bitRate + "k"
+                + " -filter:v fps=" + this.HKSVRecordingConfig.videoCodec.resolution[2]; // convert to framerate HomeKit has requested
         }
 
-        var ffmpegVideo = ffmpegVideo 
+        ffmpegVideo = ffmpegVideo 
             + " -force_key_frames expr:gte\(t,n_forced*" + this.HKSVRecordingConfig.videoCodec.parameters.iFrameInterval / 1000 + "\)"
             + " -fflags +genpts+discardcorrupt"
             + " -reset_timestamps 1"
@@ -1154,7 +1158,7 @@ CameraClass.prototype.handleRecordingStreamRequest = async function *(streamId) 
         if (includeAudio == true) {
             var audioSampleRates = ["8", "16", "24", "32", "44.1", "48"];
 
-            var ffmpegAudio = " -map 1:a"   // pipe:3, the second input is audio data
+            ffmpegAudio = " -map 1:a"   // pipe:3, the second input is audio data
                 + " -codec:a " + AudioCodecs.LIBFDK_AAC
                 + " -profile:a aac_eld" // this.HKSVRecordingConfig.audioCodec.type == AudioRecordingCodecType.AAC_ELD
                 + " -ar " + audioSampleRates[this.HKSVRecordingConfig.audioCodec.samplerate] + "k"
@@ -1246,7 +1250,7 @@ CameraClass.prototype.handleRecordingStreamRequest = async function *(streamId) 
         });
 
         this.NexusStreamer.startRecordStream("HKSV" + streamId, this.HKSVRecorder.ffmpeg, this.HKSVRecorder.video, this.HKSVRecorder.audio);
-        this.nestObject.config.debug && console.debug("[HKSV] Recording started on '%s' %s %s", this.nestObject.nestDevices[this.deviceID].mac_address, (includeAudio == true ? "with audio" : "without audio"), (this.nestObject.config.H264Encoder != VideoCodecs.COPY ? "using H264 encoder " + this.nestObject.config.H264Encoder : ""));
+        this.nestObject.config.debug && console.debug("[HKSV] Recording started on '%s' %s %s", this.nestObject.nestDevices[this.deviceID].mac_address, (includeAudio == true ? "with audio" : "without audio"), (recordCodec != VideoCodecs.COPY ? "using H264 encoder " + recordCodec : ""));
 
         try {
             for await (const mp4box of this.segmentGenerator()) {
@@ -1472,7 +1476,20 @@ CameraClass.prototype.handleStreamRequest = async function (request, callback) {
             // Build our video command for ffmpeg
             var ffmpegVideo = " -map 0:v"   // stdin, the first input is video data
                 + " -max_muxing_queue_size 9999"
-                + " -codec:v copy"  // Copy the h264 stream out. Gives lowest latency option for live stream
+                + " -codec:v " + streamCodec;
+
+            if (streamCodec == VideoCodecs.LIBX264 || streamCodec == VideoCodecs.H264_OMX || streamCodec == VideoCodecs.H264_V4L2M2M) {
+                // Configure for libx264 (software encoder) or H264_omx (RPI Hardware enccoder)
+                ffmpegVideo = ffmpegVideo 
+                    + " -pix_fmt yuv420p"
+                    + (streamCodec != VideoCodecs.H264_V4L2M2M ? " -profile:v " + ((request.video.profile == H264Profile.HIGH) ? "high" : (request.video.profile == H264Profile.MAIN) ? "main" : "baseline") : "")
+                    + (streamCodec == VideoCodecs.LIBX264 ? " -level:v " + ((request.video.level == H264Level.LEVEL4_0) ? "4.0" : (request.video.level == H264Level.LEVEL3_2) ? "3.2" : "3.1") : "")
+                    + (streamCodec == VideoCodecs.LIBX264 ? " -preset veryfast" : "")
+                    + " -b:v " + request.video.max_bit_rate + "k"
+                    + " -filter:v fps=" + request.video.fps; // convert to framerate HomeKit has requested
+            }
+
+            ffmpegVideo = ffmpegVideo
                 + " -payload_type " + request.video.pt
                 + " -ssrc " + this.ongoingSessions[request.sessionID].videoSSRC
                 + " -f rtp"
@@ -1482,7 +1499,7 @@ CameraClass.prototype.handleStreamRequest = async function (request, callback) {
             // We have seperate video and audio streams that need to be muxed together if audio enabled
             var ffmpegAudio = "";      // No audio yet command yet
             if (includeAudio == true) {
-                var ffmpegAudio = " -map 1:a"   // pipe:3, the second input is audio data
+                ffmpegAudio = " -map 1:a"   // pipe:3, the second input is audio data
                     + " -codec:a " + AudioCodecs.LIBFDK_AAC
                     + " -profile:a aac_eld" // request.codec == "ACC-eld"
                     + " -ar " + request.audio.sample_rate + "k"
@@ -1597,7 +1614,7 @@ CameraClass.prototype.handleStreamRequest = async function (request, callback) {
             this.ongoingSessions[request.sessionID].audio = request.audio;  // Cache the audio request details
 
             // Finally start the stream from nexus
-            this.nestObject.config.debug && console.debug("[NEST] Live stream started on '%s'", this.nestObject.nestDevices[this.deviceID].mac_address);
+            this.nestObject.config.debug && console.debug("[NEST] Live stream started on '%s' %s", this.nestObject.nestDevices[this.deviceID].mac_address,  (streamCodec != VideoCodecs.COPY ? "using H264 encoder " + streamCodec : ""));
             this.NexusStreamer.startLiveStream("HK" + request.sessionID, ffmpegStreaming.stdin, (includeAudio == true ? ffmpegStreaming.stdio[3] : null), (this.audioTalkback == true ? ffmpegAudioTalkback.stdout : null));
             break;
         }
@@ -2853,14 +2870,11 @@ axios.interceptors.response.use(undefined, function axiosRetryInterceptor(err) {
 
 
 // Startup code
-// Check to see if a location/and configuration file was passed into use
+// Check to see if a onfiguration file was passed into use
 var configFile = __dirname + "/" + CONFIGURATIONFILE;
 if (process.argv.slice(2).length == 1) {  // We only process one arg
     configFile = process.argv.slice(2)[0];   // Extract the file name from the argument passed in
-    if (configFile.indexOf("/") == -1) {
-        // Since no directory paths in the filename, pre-append the current path
-        configFile = __dirname + "/" + configFile;
-    }
+    if (configFile.indexOf("/") == -1) configFile = __dirname + "/" + configFile;
 }
 
 console.log("Starting Nest devices HomeKit accessory. We're using HAP-NodeJS library v" + HAPNodeJS.HAPLibraryVersion());
